@@ -1,8 +1,10 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # ✅ Add this line
 import requests
 import os
 
 app = Flask(__name__)
+CORS(app)  # ✅ Enable CORS right after initializing app
 
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "your_together_api_key_here")
 TOGETHER_MODEL = "meta-llama/Llama-3-8b-chat-hf"
@@ -42,3 +44,4 @@ def chat():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
