@@ -33,28 +33,28 @@ TAVILY_URL = "https://api.tavily.com/search"
 # ---------- AGENT CONFIG ----------
 AGENTS = {
     "general": {
-        "system": "You are BharatAI, a helpful, concise assistant. Prefer clear steps and examples.",
+        "system": "You are BharatAI, a helpful assistant. Prefer clear steps and examples.",
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.7,
         "max_tokens": 600,
     },
     "docs": {
-        "system": ("You are BharatAI, a retrieval-style assistant. Answer ONLY from the provided document "
-                   "excerpts. If the answer isn't present, say you couldn't find it."),
+        "system": ("You are BharatAI, a retrieval assistant. Answer ONLY from the provided "
+                   "document excerpts. If the answer isn't present, say so."),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.2,
         "max_tokens": 700,
     },
     "web": {
-        "system": ("You are BharatAI, a research assistant. Synthesize results succinctly. "
-                   "Cite sources as [1], [2], ... with URLs."),
+        "system": ("You are BharatAI, a research assistant. Synthesize results clearly. "
+                   "Cite sources, then list links at the end."),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.4,
         "max_tokens": 700,
     },
     "code": {
-        "system": ("You are BharatAI, a senior software engineer. Provide runnable code, brief reasoning, "
-                   "and point out edge cases. Prefer step-by-step fixes."),
+        "system": ("You are BharatAI, a senior software engineer. Provide runnable code, "
+                   "explain briefly, and point out edge cases."),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.25,
         "max_tokens": 700,
@@ -64,7 +64,6 @@ DEFAULT_AGENT_KEY = "general"
 
 # ---------- HELPERS ----------
 def extract_text_from_file(path, mimetype):
-    """Extract text from supported types; return empty string on failure."""
     try:
         if mimetype == "text/plain":
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -86,7 +85,6 @@ def extract_text_from_file(path, mimetype):
     return ""
 
 def save_files(files):
-    """Save uploads and include extracted text (truncated) for docs agent."""
     saved = []
     for f in files:
         if not getattr(f, "filename", None):
@@ -101,49 +99,43 @@ def save_files(files):
             "path": path,
             "url": url,
             "mimetype": f.mimetype,
-            "content": (text or "")[:8000]  # cap to keep prompt reasonable
+            "content": (text or "")[:8000]  # limit to avoid huge prompts
         })
     return saved
 
 def auto_router(message, saved_files):
-    """Very simple heuristic routing."""
     msg = (message or "").lower()
     if saved_files:
         if any(sf["content"] for sf in saved_files):
             return "docs"
-    if any(k in msg for k in ["search", "latest", "news", "today", "on the web", "google", "cite"]):
+    if any(k in msg for k in ["search", "latest", "news", "today", "google", "cite"]):
         return "web"
-    if any(k in msg for k in ["bug", "error", "stack trace", "function", "class", "refactor", "optimize", "code"]):
+    if any(k in msg for k in ["bug", "error", "stack", "function", "class", "code", "refactor"]):
         return "code"
     return "general"
 
 def build_messages(message, agent_key, saved_files, web_results=None):
-    """Compose chat messages for the selected agent."""
     cfg = AGENTS.get(agent_key, AGENTS[DEFAULT_AGENT_KEY])
     system = cfg["system"]
     user_content = message or ""
 
-    # Inject docs context only for docs agent (or when files exist and agent is auto->docs)
     if agent_key == "docs" and saved_files:
-        # Concatenate short headers + excerpts per file
         parts = []
         for f in saved_files:
             if f["content"]:
-                # Keep per-file slice short-ish
                 snippet = f["content"][:4000]
                 parts.append(f"--- FILE: {f['name']} ---\n{snippet}")
         if parts:
-            user_content = (f"Use ONLY the following excerpts to answer. "
+            user_content = (f"Use ONLY these excerpts to answer. "
                             f"If insufficient, say you couldn't find it.\n\n" +
                             "\n\n".join(parts) + "\n\nUSER QUESTION:\n" + (message or ""))
 
-    # Inject web results context for web agent
     if agent_key == "web" and web_results:
         bullets = []
         for i, r in enumerate(web_results, start=1):
             bullets.append(f"[{i}] {r.get('title','')}\n{r.get('url','')}\n{r.get('snippet','')}")
         ctx = "SOURCES:\n" + "\n\n".join(bullets)
-        user_content = f"{ctx}\n\nTASK: Answer the user's question. Cite sources as [1], [2], ...\n\nUSER QUESTION:\n{message or ''}"
+        user_content = f"{ctx}\n\nTASK: Answer the question. Cite sources inline as [1], [2].\n\nUSER QUESTION:\n{message or ''}"
 
     return [
         {"role": "system", "content": system},
@@ -169,10 +161,9 @@ def call_together(messages, model, temperature=0.7, max_tokens=600):
     except Exception as e:
         print("Together API error:", e)
         traceback.print_exc()
-        return "⚠️ Sorry, I couldn’t fetch a response from the AI."
+        return "⚠️ Sorry, I couldn’t fetch a response."
 
 def web_search_tavily(query, max_results=4):
-    """Optional: use Tavily if key is set; else return []."""
     if not TAVILY_API_KEY:
         return []
     try:
@@ -212,7 +203,6 @@ def too_large(e):
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
-        # Support FormData & JSON
         is_form = bool(request.form) or bool(request.files)
         if is_form:
             message = request.form.get("message", "")
@@ -228,16 +218,12 @@ def chat():
             return jsonify({"response": "⚠️ You sent an empty request."}), 400
 
         saved_files = save_files(files) if files else []
-
-        # Decide agent
         agent_key = agent_in if agent_in in AGENTS else auto_router(message, saved_files)
 
-        # Optionally do web search
         web_results = []
         if agent_key == "web":
             web_results = web_search_tavily(message)
 
-        # Build messages & call LLM
         cfg = AGENTS.get(agent_key, AGENTS[DEFAULT_AGENT_KEY])
         msgs = build_messages(message, agent_key, saved_files, web_results)
         reply = call_together(
@@ -246,14 +232,18 @@ def chat():
             max_tokens=cfg["max_tokens"]
         )
 
-        # Append simple source list for web agent
+        # ✅ Append clickable links for web results
         if agent_key == "web" and web_results:
             src_lines = []
             for i, r in enumerate(web_results, start=1):
-                src_lines.append(f"[{i}] {r.get('url','')}")
-            reply += "\n\n" + "\n".join(src_lines)
+                url = r.get("url", "")
+                title = r.get("title", f"Source {i}")
+                if url:
+                    src_lines.append(f'<a href="{url}" target="_blank" rel="noopener">🔗 {title}</a>')
+            if src_lines:
+                reply += "<br><br>" + "<br>".join(src_lines)
 
-        # Build file chips
+        # File chips
         links_html = ""
         if saved_files:
             chips = " ".join(
