@@ -30,31 +30,46 @@ TOGETHER_URL = "https://api.together.xyz/v1/chat/completions"
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 TAVILY_URL = "https://api.tavily.com/search"
 
-# ---------- AGENT CONFIG ----------
+# ---------- AGENT CONFIG (bullet-style prompts) ----------
 AGENTS = {
     "general": {
-        "system": "You are BharatAI, a helpful assistant. Prefer clear steps and examples.",
+        "system": (
+            "You are BharatAI, a helpful assistant. "
+            "Always respond concisely using bullet points or numbered steps. "
+            "Avoid long paragraphs."
+        ),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.7,
         "max_tokens": 600,
     },
     "docs": {
-        "system": ("You are BharatAI, a retrieval assistant. Answer ONLY from the provided "
-                   "document excerpts. If the answer isn't present, say so."),
+        "system": (
+            "You are BharatAI, a retrieval assistant. "
+            "Answer ONLY from the provided document excerpts. "
+            "If the answer isn't present, say so. "
+            "Always present information as bullet points or short steps."
+        ),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.2,
         "max_tokens": 700,
     },
     "web": {
-        "system": ("You are BharatAI, a research assistant. Synthesize results clearly. "
-                   "Cite sources, then list links at the end."),
+        "system": (
+            "You are BharatAI, a research assistant. "
+            "Summarize search results clearly in 3–6 bullet points with inline citations like [1], [2]. "
+            "At the end, list clickable source links."
+        ),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.4,
         "max_tokens": 700,
     },
     "code": {
-        "system": ("You are BharatAI, a senior software engineer. Provide runnable code, "
-                   "explain briefly, and point out edge cases."),
+        "system": (
+            "You are BharatAI, a senior software engineer. "
+            "Show runnable code first (inside code blocks). "
+            "Then explain in short bullet points. "
+            "Keep explanations concise."
+        ),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.25,
         "max_tokens": 700,
@@ -99,7 +114,7 @@ def save_files(files):
             "path": path,
             "url": url,
             "mimetype": f.mimetype,
-            "content": (text or "")[:8000]  # limit to avoid huge prompts
+            "content": (text or "")[:8000]
         })
     return saved
 
@@ -126,16 +141,22 @@ def build_messages(message, agent_key, saved_files, web_results=None):
                 snippet = f["content"][:4000]
                 parts.append(f"--- FILE: {f['name']} ---\n{snippet}")
         if parts:
-            user_content = (f"Use ONLY these excerpts to answer. "
-                            f"If insufficient, say you couldn't find it.\n\n" +
-                            "\n\n".join(parts) + "\n\nUSER QUESTION:\n" + (message or ""))
+            user_content = (
+                f"Use ONLY these excerpts to answer. "
+                f"If insufficient, say you couldn't find it.\n\n" +
+                "\n\n".join(parts) +
+                "\n\nUSER QUESTION:\n" + (message or "")
+            )
 
     if agent_key == "web" and web_results:
         bullets = []
         for i, r in enumerate(web_results, start=1):
             bullets.append(f"[{i}] {r.get('title','')}\n{r.get('url','')}\n{r.get('snippet','')}")
         ctx = "SOURCES:\n" + "\n\n".join(bullets)
-        user_content = f"{ctx}\n\nTASK: Answer the question. Cite sources inline as [1], [2].\n\nUSER QUESTION:\n{message or ''}"
+        user_content = (
+            f"{ctx}\n\nTASK: Answer the question. "
+            f"Summarize in bullet points with inline citations like [1], [2].\n\nUSER QUESTION:\n{message or ''}"
+        )
 
     return [
         {"role": "system", "content": system},
@@ -232,7 +253,7 @@ def chat():
             max_tokens=cfg["max_tokens"]
         )
 
-        # ✅ Append clickable links for web results
+        # Append clickable links for web results
         if agent_key == "web" and web_results:
             src_lines = []
             for i, r in enumerate(web_results, start=1):
