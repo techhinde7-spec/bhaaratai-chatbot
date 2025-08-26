@@ -30,13 +30,13 @@ TOGETHER_URL = "https://api.together.xyz/v1/chat/completions"
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 TAVILY_URL = "https://api.tavily.com/search"
 
-# ---------- AGENT CONFIG (bullet-style prompts) ----------
+# ---------- AGENT CONFIG (STRICT bullet rules) ----------
 AGENTS = {
     "general": {
         "system": (
             "You are BharatAI, a helpful assistant. "
-            "Always respond concisely using bullet points or numbered steps. "
-            "Avoid long paragraphs."
+            "Always respond ONLY using bullet points or numbered lists. "
+            "Never write paragraphs."
         ),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.7,
@@ -45,9 +45,10 @@ AGENTS = {
     "docs": {
         "system": (
             "You are BharatAI, a retrieval assistant. "
-            "Answer ONLY from the provided document excerpts. "
-            "If the answer isn't present, say so. "
-            "Always present information as bullet points or short steps."
+            "Answer ONLY from the provided documents. "
+            "If no answer is present, say so. "
+            "Always respond in bullet points or numbered lists ONLY. "
+            "Never use paragraphs."
         ),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.2,
@@ -56,8 +57,9 @@ AGENTS = {
     "web": {
         "system": (
             "You are BharatAI, a research assistant. "
-            "Summarize search results clearly in 3–6 bullet points with inline citations like [1], [2]. "
-            "At the end, list clickable source links."
+            "Summarize search results in 3–6 bullet points with inline citations like [1], [2]. "
+            "At the end, add clickable source links. "
+            "Do NOT write paragraphs — bullet points only."
         ),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.4,
@@ -66,9 +68,9 @@ AGENTS = {
     "code": {
         "system": (
             "You are BharatAI, a senior software engineer. "
-            "Show runnable code first (inside code blocks). "
+            "Always start with runnable code (inside triple backticks). "
             "Then explain in short bullet points. "
-            "Keep explanations concise."
+            "Never use long paragraphs."
         ),
         "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.25,
@@ -155,8 +157,11 @@ def build_messages(message, agent_key, saved_files, web_results=None):
         ctx = "SOURCES:\n" + "\n\n".join(bullets)
         user_content = (
             f"{ctx}\n\nTASK: Answer the question. "
-            f"Summarize in bullet points with inline citations like [1], [2].\n\nUSER QUESTION:\n{message or ''}"
+            f"Summarize ONLY in bullet points with inline citations like [1], [2].\n\nUSER QUESTION:\n{message or ''}"
         )
+
+    # 🔑 Reinforce bullet rules in every prompt
+    user_content += "\n\nRemember: Use ONLY bullet points or numbered lists. Never write paragraphs."
 
     return [
         {"role": "system", "content": system},
