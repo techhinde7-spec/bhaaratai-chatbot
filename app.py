@@ -1,5 +1,5 @@
 # app.py
-import os, uuid, datetime, traceback, requests
+import os, uuid, datetime, traceback, requests, time, re, base64
 from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 
@@ -24,11 +24,16 @@ except Exception:
 
 # LLM (Together)
 TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "your_key_here")
-TOGETHER_URL = "https://api.together.xyz/v1/chat/completions"
+TOGETHER_URL = os.environ.get("TOGETHER_URL", "https://api.together.xyz/v1/chat/completions")
+
+# Hugging Face image inference (set HF_API_TOKEN in your env)
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN", None)
+HF_MODEL = os.environ.get("HF_MODEL", "stabilityai/stable-diffusion-2")
+HF_MAX_RETRIES = int(os.environ.get("HF_MAX_RETRIES", "3"))
 
 # Optional Web Search (Tavily). Set env: TAVILY_API_KEY
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-TAVILY_URL = "https://api.tavily.com/search"
+TAVILY_URL = os.environ.get("TAVILY_URL", "https://api.tavily.com/search")
 
 # ---------- AGENT CONFIG (STRICT bullet rules) ----------
 AGENTS = {
@@ -213,6 +218,73 @@ def web_search_tavily(query, max_results=4):
         print("Tavily error:", e)
         return []
 
+# ---------- Hugging Face image helper ----------
+def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=120):
+    """
+    Calls Hugging Face inference API.
+    Returns: list of image data-URLs or remote URLs.
+    """
+    if not HF_API_TOKEN:
+        raise RuntimeError("HF_API_TOKEN not set in environment")
+
+    hf_url = f"https://api-inference.huggingface.co/models/{model}"
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Accept": "image/png, application/json",
+    }
+    payload = {"inputs": prompt}
+    for attempt in range(max_retries):
+        resp = requests.post(hf_url, json=payload, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            content_type = resp.headers.get("Content-Type", "")
+            # direct image bytes
+            if content_type.startswith("image/"):
+                img_bytes = resp.content
+                b64 = base64.b64encode(img_bytes).decode("utf-8")
+                return [f"data:{content_type};base64,{b64}"]
+            # JSON response (could include b64_json or urls)
+            try:
+                j = resp.json()
+                images = []
+                if isinstance(j, list):
+                    for item in j:
+                        if isinstance(item, dict):
+                            if item.get("b64_json"):
+                                images.append(f"data:image/png;base64,{item['b64_json']}")
+                            elif item.get("url"):
+                                images.append(item["url"])
+                            elif item.get("generated_image"):
+                                images.append(item["generated_image"])
+                        elif isinstance(item, str) and item.startswith("http"):
+                            images.append(item)
+                elif isinstance(j, dict):
+                    if j.get("images") and isinstance(j["images"], list):
+                        for it in j["images"]:
+                            if isinstance(it, str):
+                                images.append(it)
+                            elif isinstance(it, dict) and it.get("b64_json"):
+                                images.append(f"data:image/png;base64,{it['b64_json']}")
+                    if j.get("data") and isinstance(j["data"], list):
+                        for d in j["data"]:
+                            if isinstance(d, dict) and d.get("b64_json"):
+                                images.append(f"data:image/png;base64,{d['b64_json']}")
+                if images:
+                    return images
+            except Exception:
+                pass
+            # fallback to raw text body
+            return [resp.text]
+        elif resp.status_code in (503, 202):
+            time.sleep(2 + attempt * 2)
+            continue
+        else:
+            try:
+                err = resp.json()
+            except Exception:
+                err = resp.text
+            raise RuntimeError(f"Hugging Face error {resp.status_code}: {err}")
+    raise RuntimeError("Hugging Face model not ready after retries")
+
 # ---------- ROUTES ----------
 @app.route("/health")
 def health():
@@ -258,6 +330,26 @@ def chat():
             max_tokens=cfg["max_tokens"]
         )
 
+        images = []
+        # 1) detect explicit user intent `/image prompt` -> generate image directly from user prompt
+        m_user_img = re.match(r"^/image\s+(.+)$", (message or "").strip(), flags=re.IGNORECASE)
+        if m_user_img:
+            img_prompt = m_user_img.group(1).strip()
+            try:
+                images = call_hf_image(img_prompt)
+            except Exception as e_img:
+                reply += f"\n\n[Image generation failed: {str(e_img)}]"
+
+        # 2) detect model instruction in the reply like: [generate_image: prompt]
+        if not images:
+            m = re.search(r"\[generate_image\s*:\s*(.+?)\]", reply, flags=re.IGNORECASE)
+            if m:
+                img_prompt = m.group(1).strip()
+                try:
+                    images = call_hf_image(img_prompt)
+                except Exception as e_img:
+                    reply += f"\n\n[Image generation failed: {str(e_img)}]"
+
         # Append clickable links for web results
         if agent_key == "web" and web_results:
             src_lines = []
@@ -278,16 +370,37 @@ def chat():
             )
             links_html = f"<div class='file-chip-wrap'>{chips}</div>"
 
-        print(f">>> Agent: {agent_key}  Msg: {message[:80]!r}  Files: {len(saved_files)}")
+        print(f">>> Agent: {agent_key}  Msg: {message[:80]!r}  Files: {len(saved_files)}  Images: {len(images)}")
         return jsonify({
             "response": f"{reply}{links_html}",
             "agent": agent_key,
-            "files": saved_files
+            "files": saved_files,
+            "images": images
         })
 
     except Exception as ex:
         print("ERROR /chat:", ex); traceback.print_exc()
         return jsonify({"response": "⚠️ Server error while handling your request.", "error": str(ex)}), 500
+
+@app.route("/generate-image", methods=["POST"])
+def generate_image():
+    """
+    Called by frontend image button.
+    Expects JSON: { prompt: "...", language: "en" }
+    Returns: { images: [dataUrl1, ...], model: HF_MODEL }
+    """
+    try:
+        body = request.get_json(force=True)
+        prompt = (body.get("prompt") or body.get("text") or "").strip()
+        language = body.get("language", "en")
+        if not prompt:
+            return jsonify({"error": "missing_prompt"}), 400
+
+        final_prompt = f"{prompt} (language: {language})"
+        images = call_hf_image(final_prompt)
+        return jsonify({"images": images, "model": HF_MODEL})
+    except Exception as e:
+        return jsonify({"error": "image_generation_failed", "details": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
