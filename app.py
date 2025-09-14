@@ -1,5 +1,5 @@
 # app.py
-import os, uuid, datetime, traceback, requests, time, re, base64
+import os, uuid, datetime, traceback, requests, time, re, base64, json
 from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 
@@ -218,11 +218,12 @@ def web_search_tavily(query, max_results=4):
         print("Tavily error:", e)
         return []
 
-# ---------- Hugging Face image helper ----------
+# ---------- Hugging Face image helper (IMPROVED & LOGGING) ----------
 def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=120):
     """
-    Calls Hugging Face inference API.
+    Calls Hugging Face inference API robustly.
     Returns: list of image data-URLs or remote URLs.
+    Raises RuntimeError on unrecoverable error.
     """
     if not HF_API_TOKEN:
         raise RuntimeError("HF_API_TOKEN not set in environment")
@@ -230,60 +231,118 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=12
     hf_url = f"https://api-inference.huggingface.co/models/{model}"
     headers = {
         "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Accept": "image/png, application/json",
+        "Accept": "image/png, application/json, application/octet-stream",
+        "User-Agent": "BharatAI/Render"
     }
-    payload = {"inputs": prompt}
-    for attempt in range(max_retries):
-        resp = requests.post(hf_url, json=payload, headers=headers, timeout=timeout)
-        if resp.status_code == 200:
-            content_type = resp.headers.get("Content-Type", "")
-            # direct image bytes
-            if content_type.startswith("image/"):
-                img_bytes = resp.content
-                b64 = base64.b64encode(img_bytes).decode("utf-8")
-                return [f"data:{content_type};base64,{b64}"]
-            # JSON response (could include b64_json or urls)
-            try:
-                j = resp.json()
+
+    # Use options.wait_for_model to reduce 202 responses if model is cold
+    payload = {
+        "inputs": prompt,
+        "options": {"wait_for_model": True}
+    }
+
+    backoff = [1, 2, 4, 8]
+    attempts = max_retries if max_retries > 0 else len(backoff)
+
+    last_exception = None
+    for attempt in range(attempts):
+        try:
+            print(f"[HF] POST {hf_url} attempt={attempt+1}/{attempts} payload_len={len(prompt)}")
+            resp = requests.post(hf_url, json=payload, headers=headers, timeout=timeout)
+            print(f"[HF] status={resp.status_code} content-type={resp.headers.get('Content-Type')}")
+            # 200 -> could be image bytes or JSON
+            if resp.status_code == 200:
+                content_type = resp.headers.get("Content-Type", "")
+                # direct image bytes
+                if content_type.startswith("image/"):
+                    img_bytes = resp.content
+                    b64 = base64.b64encode(img_bytes).decode("utf-8")
+                    data_url = f"data:{content_type};base64,{b64}"
+                    return [data_url]
+
+                # JSON or list response
+                try:
+                    j = resp.json()
+                except Exception as je:
+                    # fallback: return raw text (could be base64 string)
+                    body = resp.text
+                    # if body looks like base64 => normalize
+                    if isinstance(body, str) and len(body) > 50 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r" for c in body.strip()):
+                        return [f"data:image/png;base64,{body.strip()}"]
+                    return [body]
+
+                # parse JSON payload for b64 or urls
                 images = []
+                # list-of-items
                 if isinstance(j, list):
                     for item in j:
-                        if isinstance(item, dict):
-                            if item.get("b64_json"):
-                                images.append(f"data:image/png;base64,{item['b64_json']}")
-                            elif item.get("url"):
-                                images.append(item["url"])
-                            elif item.get("generated_image"):
-                                images.append(item["generated_image"])
+                        if isinstance(item, dict) and item.get("b64_json"):
+                            images.append(f"data:image/png;base64,{item['b64_json']}")
+                        elif isinstance(item, dict) and item.get("url"):
+                            images.append(item["url"])
                         elif isinstance(item, str) and item.startswith("http"):
                             images.append(item)
                 elif isinstance(j, dict):
-                    if j.get("images") and isinstance(j["images"], list):
-                        for it in j["images"]:
-                            if isinstance(it, str):
-                                images.append(it)
-                            elif isinstance(it, dict) and it.get("b64_json"):
-                                images.append(f"data:image/png;base64,{it['b64_json']}")
+                    # HF sometimes returns {"data": [{"b64_json": "..."}, ...]}
                     if j.get("data") and isinstance(j["data"], list):
                         for d in j["data"]:
                             if isinstance(d, dict) and d.get("b64_json"):
                                 images.append(f"data:image/png;base64,{d['b64_json']}")
+                            elif isinstance(d, dict) and d.get("url"):
+                                images.append(d["url"])
+                    # sometimes {"images": ["http...", ...]}
+                    if j.get("images") and isinstance(j["images"], list):
+                        for it in j["images"]:
+                            if isinstance(it, str) and it.startswith("http"):
+                                images.append(it)
+                            elif isinstance(it, dict) and it.get("b64_json"):
+                                images.append(f"data:image/png;base64,{it['b64_json']}")
+                    # direct b64 field
+                    if j.get("b64_json"):
+                        images.append(f"data:image/png;base64,{j.get('b64_json')}")
                 if images:
                     return images
-            except Exception:
-                pass
-            # fallback to raw text body
-            return [resp.text]
-        elif resp.status_code in (503, 202):
-            time.sleep(2 + attempt * 2)
+
+                # no images found in JSON; return textual body as fallback
+                return [json.dumps(j)]
+
+            # transient server busy / model loading
+            elif resp.status_code in (202, 503, 429):
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = resp.text
+                print(f"[HF] transient status {resp.status_code}, body: {str(body)[:300]}")
+                wait = backoff[min(attempt, len(backoff)-1)]
+                time.sleep(wait)
+                last_exception = RuntimeError(f"HF transient status {resp.status_code}: {body}")
+                continue
+
+            else:
+                # non-transient error -> raise with body
+                try:
+                    err = resp.json()
+                except Exception:
+                    err = resp.text
+                raise RuntimeError(f"Hugging Face error {resp.status_code}: {err}")
+
+        except requests.exceptions.RequestException as req_exc:
+            print(f"[HF] request exception: {req_exc}")
+            traceback.print_exc()
+            last_exception = req_exc
+            wait = backoff[min(attempt, len(backoff)-1)]
+            time.sleep(wait)
             continue
-        else:
-            try:
-                err = resp.json()
-            except Exception:
-                err = resp.text
-            raise RuntimeError(f"Hugging Face error {resp.status_code}: {err}")
-    raise RuntimeError("Hugging Face model not ready after retries")
+        except Exception as exc:
+            print(f"[HF] unexpected exception: {exc}")
+            traceback.print_exc()
+            last_exception = exc
+            break
+
+    # after attempts
+    if last_exception:
+        raise RuntimeError(f"Hugging Face call failed after {attempts} attempts: {last_exception}")
+    raise RuntimeError("Hugging Face call failed for unknown reasons")
 
 # ---------- ROUTES ----------
 @app.route("/health")
@@ -397,10 +456,27 @@ def generate_image():
             return jsonify({"error": "missing_prompt"}), 400
 
         final_prompt = f"{prompt} (language: {language})"
-        images = call_hf_image(final_prompt)
-        return jsonify({"images": images, "model": HF_MODEL})
+        try:
+            images = call_hf_image(final_prompt)
+            return jsonify({"images": images, "model": HF_MODEL})
+        except Exception as hf_err:
+            tb = traceback.format_exc()
+            # Print detailed info to logs (Render log)
+            print("ERROR generating image:", hf_err)
+            print(tb)
+            # Return helpful payload to client for debugging
+            return jsonify({
+                "error": "image_generation_failed",
+                "details": str(hf_err),
+                "traceback": tb
+            }), 500
+
     except Exception as e:
-        return jsonify({"error": "image_generation_failed", "details": str(e)}), 500
+        tb = traceback.format_exc()
+        print("generate_image top-level error:", e)
+        print(tb)
+        return jsonify({"error": "invalid_request", "details": str(e), "traceback": tb}), 500
 
 if __name__ == "__main__":
+    # Keep debug True locally, Render will run via gunicorn
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
