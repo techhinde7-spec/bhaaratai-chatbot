@@ -223,16 +223,18 @@ STABLE_HORDE_POLL_INTERVAL = float(os.environ.get("STABLE_HORDE_POLL_INTERVAL", 
 # ---------- Stable Horde (fallback) ----------
 def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_TIMEOUT, poll_interval=STABLE_HORDE_POLL_INTERVAL):
     """
-    Submit async generation to Stable Horde and poll until done.
+    Submit async generation to Stable Horde (aihorde.net) and poll until done.
     Returns list of data URLs or http URLs.
+    This is a blocking call (it submits then polls until completion or timeout).
     """
     if not prompt:
         raise RuntimeError("Empty prompt for Stable Horde")
 
-    submit_url = "https://stablehorde.net/api/v2/generate/async"
+    submit_url = "https://aihorde.net/api/v2/generate/async"
     headers = {"apikey": api_key, "Content-Type": "application/json"}
     payload = {
         "prompt": prompt,
+        "models": ["stable_diffusion"],
         "params": {
             "steps": 20,
             "cfg_scale": 7.0,
@@ -259,6 +261,7 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
         raise RuntimeError("Stable Horde submit: failed to parse JSON response")
 
     job_id = job.get("id") or job.get("request_id") or job.get("job_id") or job.get("requestUUID")
+    # Sometimes API returns images immediately (rare) in "images" field
     if not job_id:
         if isinstance(job, dict) and job.get("images"):
             out = []
@@ -271,7 +274,8 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
                 return out
         raise RuntimeError(f"Stable Horde submit: no job id in response: {job}")
 
-    check_url = f"https://stablehorde.net/api/v2/generate/check/{job_id}"
+    # Poll status endpoint used in earlier tests
+    check_url = f"https://aihorde.net/api/v2/generate/status/{job_id}"
     deadline = time.time() + timeout
     last_err = None
     while time.time() < deadline:
@@ -287,34 +291,96 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
             time.sleep(poll_interval)
             continue
 
-        if status.get("done") or status.get("finished") or status.get("status") == "done":
+        # Look for the common indicators that it's done
+        if status.get("done") or status.get("finished") or status.get("status") == "done" or status.get("is_possible") is True and status.get("done"):
             images = []
-            if isinstance(status, dict):
-                if status.get("images") and isinstance(status["images"], list):
-                    for it in status["images"]:
-                        if isinstance(it, dict) and it.get("img"):
-                            images.append("data:image/png;base64," + it["img"])
-                        elif isinstance(it, str):
-                            if it.startswith("http"):
-                                images.append(it)
+            # common shapes: 'generations' with dicts containing 'img' or 'img' as URL
+            gens = status.get("generations") or status.get("images") or []
+            if isinstance(gens, list):
+                for g in gens:
+                    if isinstance(g, str) and g.startswith("http"):
+                        images.append(g)
+                    elif isinstance(g, dict):
+                        # { img: "url" } or { img: "base64..." }
+                        img_field = g.get("img") or g.get("image") or g.get("url")
+                        if isinstance(img_field, str):
+                            if img_field.startswith("http"):
+                                images.append(img_field)
+                            elif img_field.startswith("data:"):
+                                images.append(img_field)
                             else:
-                                images.append("data:image/png;base64," + it)
-                if status.get("generations") and isinstance(status["generations"], list):
-                    for g in status["generations"]:
-                        if isinstance(g, dict) and g.get("img"):
-                            images.append("data:image/png;base64," + g["img"])
-                if status.get("result") and isinstance(status["result"], list):
-                    for it in status["result"]:
-                        if isinstance(it, dict) and it.get("img"):
-                            images.append("data:image/png;base64," + it["img"])
+                                # sometimes it's raw base64
+                                if len(img_field) > 60 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", img_field.replace("\n","").replace("\r","")):
+                                    images.append("data:image/png;base64," + img_field.replace("\n","").replace("\r",""))
+            # also some responses include "result" or "outputs"
+            if isinstance(status, dict):
+                for key in ("result", "outputs"):
+                    if key in status and isinstance(status[key], list):
+                        for it in status[key]:
+                            if isinstance(it, dict) and it.get("img"):
+                                images.append("data:image/png;base64," + it["img"])
+                            elif isinstance(it, str) and it.startswith("http"):
+                                images.append(it)
             images = [i for i in images if i]
             if images:
                 return images
-            raise RuntimeError(f"Stable Horde finished but returned no images: {status}")
+            # If finished but no images found, still raise
+            if status.get("done") or status.get("finished"):
+                raise RuntimeError(f"Stable Horde finished but returned no images: {status}")
 
         time.sleep(poll_interval)
 
     raise RuntimeError(f"Stable Horde generation timed out after {timeout}s. Last error: {last_err}")
+
+# ---------- New: Async submit & status helpers for Stable Horde ----------
+def stablehorde_submit_async(prompt, api_key=STABLE_HORDE_API_KEY):
+    """
+    Submit to aihorde async endpoint and return the job id (or raise).
+    """
+    submit_url = "https://aihorde.net/api/v2/generate/async"
+    headers = {"apikey": api_key, "Content-Type": "application/json"}
+    payload = {
+        "prompt": prompt,
+        "models": ["stable_diffusion"],
+        "params": {"steps": 20, "cfg_scale": 7.0, "width": 512, "height": 512}
+    }
+    r = requests.post(submit_url, json=payload, headers=headers, timeout=30)
+    if r.status_code >= 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        raise RuntimeError(f"Stable Horde submit error {r.status_code}: {body}")
+    j = r.json()
+    job_id = j.get("id") or j.get("request_id") or j.get("job_id") or j.get("requestUUID")
+    if not job_id:
+        # sometimes immediate images are returned
+        if isinstance(j, dict) and j.get("images"):
+            imgs = []
+            for it in j["images"]:
+                if isinstance(it, dict) and it.get("img"):
+                    imgs.append("data:image/png;base64," + it["img"])
+                elif isinstance(it, str) and it.startswith("http"):
+                    imgs.append(it)
+            if imgs:
+                return {"job_id": None, "images": imgs}
+        raise RuntimeError(f"No job id returned from Stable Horde submit: {j}")
+    return {"job_id": job_id, "raw": j}
+
+def stablehorde_get_status(job_id, api_key=STABLE_HORDE_API_KEY):
+    """
+    Query aihorde status endpoint and return the parsed JSON.
+    """
+    check_url = f"https://aihorde.net/api/v2/generate/status/{job_id}"
+    headers = {"apikey": api_key}
+    r = requests.get(check_url, headers=headers, timeout=30)
+    if r.status_code != 200:
+        # return the raw body for debugging
+        try:
+            return {"error": r.text, "status_code": r.status_code}
+        except Exception:
+            return {"error": "unknown error", "status_code": r.status_code}
+    return r.json()
 
 # ---------- Hugging Face image helper (IMPROVED & LOGGING) ----------
 def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=REQUEST_TIMEOUT):
@@ -516,6 +582,7 @@ def generate_via_preferred_provider(prompt, language="en"):
     Returns (images_list, provider_name)
     Tries Hugging Face first (if HF_API_TOKEN present and not forced off), otherwise uses Stable Horde.
     Ensures returned image strings are absolute URLs the frontend can fetch.
+    This is a blocking call (it will poll Stable Horde if needed).
     """
     final_prompt = f"{prompt} (language: {language})"
     # prefer HF unless forced off
@@ -843,6 +910,7 @@ def generate_image():
     Called by frontend image button.
     Expects JSON: { prompt: "...", language: "en" }
     Returns: { images: [absolute_url1, ...], provider: "huggingface"|"stablehorde" }
+    This endpoint is synchronous: it will block until provider returns images (HF immediate or Stable Horde polled).
     """
     try:
         try:
@@ -895,6 +963,100 @@ def generate_image():
         print("generate_image top-level error:", e)
         print(tb)
         return jsonify({"error": "invalid_request", "details": str(e), "traceback": tb}), 500
+
+# ---------------- New async endpoints for Stable Horde ----------------
+@app.route("/generate-image-async", methods=["POST"])
+def generate_image_async():
+    """
+    Submit an image generation job to Stable Horde and return job_id immediately.
+    JSON body: { prompt: "..." }
+    Returns: { job_id: "...", provider: "stablehorde" } or { images: [...] } if images returned immediately.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        prompt = (data.get("prompt") or data.get("text") or "").strip()
+        if not prompt:
+            return jsonify({"error": "missing_prompt"}), 400
+
+        try:
+            res = stablehorde_submit_async(prompt)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print("stablehorde submit error:", e)
+            print(tb)
+            return jsonify({"error": "stablehorde_submit_failed", "details": str(e)}), 500
+
+        # If submission returned images immediately (rare), return them
+        if res.get("images"):
+            imgs = _ensure_saved_urls_from_list(res["images"])
+            return jsonify({"images": imgs, "provider": "stablehorde"})
+
+        job_id = res.get("job_id")
+        if not job_id:
+            return jsonify({"error": "no_job_id_returned", "raw": res}), 500
+
+        return jsonify({"job_id": job_id, "provider": "stablehorde"})
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("generate_image_async error:", e)
+        print(tb)
+        return jsonify({"error": "internal_error", "details": str(e)}), 500
+
+@app.route("/image-status/<job_id>", methods=["GET"])
+def image_status(job_id):
+    """
+    Poll Stable Horde status for job_id and return a normalized response.
+    Returns { status: "processing"|"done"|"failed", img_url: "...", generations: [...] }
+    """
+    try:
+        info = stablehorde_get_status(job_id)
+        # If error dictionary returned
+        if info is None:
+            return jsonify({"status": "processing"}), 202
+        if isinstance(info, dict) and info.get("error"):
+            return jsonify({"status": "error", "details": info.get("error"), "status_code": info.get("status_code")}), 500
+
+        # look for finished
+        done = False
+        if info.get("done") or info.get("finished") or info.get("status") == "done" or info.get("is_possible") is True and info.get("done"):
+            done = True
+
+        generations = info.get("generations") or info.get("images") or []
+        images = []
+        if isinstance(generations, list):
+            for g in generations:
+                if isinstance(g, str) and g.startswith("http"):
+                    images.append(g)
+                elif isinstance(g, dict):
+                    img_field = g.get("img") or g.get("image") or g.get("url")
+                    if isinstance(img_field, str):
+                        if img_field.startswith("http"):
+                            images.append(img_field)
+                        elif img_field.startswith("data:"):
+                            images.append(img_field)
+                        else:
+                            # base64 heuristics
+                            cand = img_field.replace("\n","").replace("\r","")
+                            if len(cand) > 60 and re.fullmatch(r"[A-Za-z0-9+/=]+", cand):
+                                images.append("data:image/png;base64," + cand)
+        # If done and images found - normalize and return first one + generations
+        if done and images:
+            saved = _ensure_saved_urls_from_list(images)
+            return jsonify({"status": "done", "img_url": saved[0] if saved else images[0], "generations": images})
+        # If done but no images present, still return raw info
+        if done:
+            return jsonify({"status": "done", "generations": generations, "raw": info})
+
+        # still processing
+        return jsonify({"status": "processing", "queue_position": info.get("queue_position"), "wait_time": info.get("wait_time")}), 202
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("image_status error:", e)
+        print(tb)
+        return jsonify({"status": "error", "details": str(e)}), 500
+
+# ------------------------------------------------------------------------
 
 if __name__ == "__main__":
     # Keep debug True locally, Render will run via gunicorn
