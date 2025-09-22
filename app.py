@@ -509,6 +509,44 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
     if last_exception:
         raise RuntimeError(f"Hugging Face call failed after {attempts} attempts: {last_exception}")
     raise RuntimeError("Hugging Face call failed for unknown reasons")
+
+# wrapper that chooses provider (HF preferred unless forced off)
+def generate_via_preferred_provider(prompt, language="en"):
+    """
+    Returns (images_list, provider_name)
+    Tries Hugging Face first (if HF_API_TOKEN present and not forced off), otherwise uses Stable Horde.
+    Ensures returned image strings are absolute URLs the frontend can fetch.
+    """
+    final_prompt = f"{prompt} (language: {language})"
+    # prefer HF unless forced off
+    if HF_API_TOKEN and not FORCE_STABLE_HORDE:
+        try:
+            imgs = call_hf_image(final_prompt)
+            provider = "huggingface"
+        except Exception as e:
+            print("[image] Hugging Face failed, falling back to Stable Horde:", e)
+            try:
+                imgs = call_stablehorde(final_prompt)
+                provider = "stablehorde"
+            except Exception as e2:
+                raise RuntimeError(f"Hugging Face failed: {e}; Stable Horde failed: {e2}")
+    else:
+        try:
+            imgs = call_stablehorde(final_prompt)
+            provider = "stablehorde"
+        except Exception as e:
+            raise RuntimeError(f"Stable Horde failed: {e}")
+
+    # Normalize images into absolute URLs where possible (re-use your helper)
+    normalized = []
+    for it in (imgs or []):
+        try:
+            u = ensure_absolute_url(it)
+            normalized.append(u or it)
+        except Exception:
+            normalized.append(it)
+    return normalized, provider
+
 # ---------- LOG STARTUP ----------
 print(f"[startup] HF_MODEL = {HF_MODEL}")
 print(f"[startup] HF_API_TOKEN present: {bool(HF_API_TOKEN)}; FORCE_STABLE_HORDE={FORCE_STABLE_HORDE}; STABLE_HORDE_KEY_present={STABLE_HORDE_API_KEY != '0000000000'}")
