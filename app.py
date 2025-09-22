@@ -43,6 +43,135 @@ def save_image_bytes_and_get_url(img_bytes, ext="png"):
     if not base:
         base = os.environ.get("BACKEND_URL", "").rstrip("/")
     return f"{base}/uploads/{fname}"
+# ---------- New helper: normalize / persist returned image entries ----------
+def normalize_image_entry(entry):
+    """
+    Accepts: string or dict or list. Returns an absolute URL the frontend can fetch,
+    or None if it can't be normalized.
+    Uses ensure_absolute_url and save_base64 helpers defined earlier.
+    """
+    try:
+        # If it's already a URL or data:... or base64 string, ensure_absolute_url will handle.
+        if isinstance(entry, str):
+            s = entry.strip()
+
+            # If string looks like a JSON-encoded object, parse and try to extract b64/url
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    parsed = json.loads(s)
+                    # prefer b64_json, img, image, url fields
+                    for key in ("b64_json", "img", "image", "data", "url"):
+                        if key in parsed and isinstance(parsed[key], str) and parsed[key].strip():
+                            candidate = parsed[key].strip()
+                            # If it's an object like {"data":{"b64_json": "..."}}
+                            if isinstance(parsed[key], dict):
+                                continue
+                            # If this looks like base64 or data:, return normalized
+                            maybe = normalize_image_entry(candidate)
+                            if maybe:
+                                return maybe
+                    # fallback: scan values for a long base64-like string
+                    for v in parsed.values():
+                        if isinstance(v, str) and len(v) > 60 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", v.replace("\n","").replace("\r","")):
+                            return save_base64_and_return_url(v)
+                except Exception:
+                    # not valid JSON, fall through to base64 checks
+                    pass
+
+            # If it's data:...base64, or raw base64, pass to ensure_absolute_url (which saves)
+            try:
+                maybe = ensure_absolute_url(s)
+                if maybe:
+                    return maybe
+            except Exception as e:
+                print("[normalize_image_entry] ensure_absolute_url failed:", e)
+
+            return None
+
+        # If it's a dict with expected fields
+        if isinstance(entry, dict):
+            for key in ("b64_json", "img", "image", "data", "url"):
+                if key in entry and isinstance(entry[key], str) and entry[key].strip():
+                    maybe = normalize_image_entry(entry[key].strip())
+                    if maybe:
+                        return maybe
+            # if nested: try converting dict -> json -> string handling
+            try:
+                text = json.dumps(entry)
+                return normalize_image_entry(text)
+            except Exception:
+                pass
+
+        # arrays: try first element
+        if isinstance(entry, list) and entry:
+            return normalize_image_entry(entry[0])
+
+    except Exception as exc:
+        print("[normalize_image_entry] unexpected:", exc)
+    return None
+
+
+# ---------- Updated / safer generate_image route ----------
+@app.route("/generate-image", methods=["POST"])
+def generate_image():
+    """
+    Called by frontend image button.
+    Expects JSON: { prompt: "...", language: "en" }
+    Returns: { images: [absolute_url1, ...], provider: "huggingface"|"stablehorde" }
+    """
+    try:
+        try:
+            body = request.get_json(silent=True)
+        except Exception:
+            return jsonify({"error": "invalid_json", "details": "Failed to parse JSON request body."}), 400
+
+        if not body or not isinstance(body, dict):
+            return jsonify({"error": "invalid_request", "details": "Request body must be a JSON object with a 'prompt' field."}), 400
+
+        prompt = (body.get("prompt") or body.get("text") or "").strip()
+        language = body.get("language", "en")
+        if not prompt:
+            return jsonify({"error": "missing_prompt"}), 400
+
+        # call provider(s)
+        try:
+            images, provider = generate_via_preferred_provider(prompt, language=language)
+        except Exception as hf_err:
+            tb = traceback.format_exc()
+            print("ERROR generating image:", hf_err)
+            print(tb)
+            return jsonify({
+                "error": "image_generation_failed",
+                "details": str(hf_err),
+                "traceback": tb
+            }), 500
+
+        # Normalize/convert each returned image entry into an absolute URL where possible
+        normalized = []
+        for it in (images or []):
+            try:
+                url = normalize_image_entry(it)
+                if url:
+                    normalized.append(url)
+                else:
+                    # last-resort: attempt ensure_absolute_url (may return same or None)
+                    fallback = ensure_absolute_url(it) if isinstance(it, str) else None
+                    if fallback:
+                        normalized.append(fallback)
+                    else:
+                        # include raw item so frontend can inspect error shapes
+                        normalized.append(it)
+            except Exception as e:
+                print("[generate-image] normalization failed for entry:", e)
+                normalized.append(it)
+
+        return jsonify({"images": normalized, "provider": provider})
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("generate_image top-level error:", e)
+        print(tb)
+        return jsonify({"error": "invalid_request", "details": str(e), "traceback": tb}), 500
 
 
 def save_base64_and_return_url(b64_str):
