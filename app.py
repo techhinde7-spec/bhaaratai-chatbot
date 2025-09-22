@@ -36,7 +36,10 @@ def save_image_bytes_and_get_url(img_bytes, ext="png"):
     with open(path, "wb") as f:
         f.write(img_bytes)
     # Build an absolute URL so the frontend (on a different origin) fetches from backend correctly
-    base = (flask_request.url_root or "").rstrip("/") if flask_request else os.environ.get("BACKEND_URL", "")
+    try:
+        base = (flask_request.url_root or "").rstrip("/")
+    except Exception:
+        base = os.environ.get("BACKEND_URL", "").rstrip("/")
     if not base:
         base = os.environ.get("BACKEND_URL", "").rstrip("/")
     return f"{base}/uploads/{fname}"
@@ -84,7 +87,10 @@ def ensure_absolute_url(s):
     if s.startswith("data:"):
         return save_base64_and_return_url(s)
     if s.startswith("/uploads/"):
-        base = (flask_request.url_root or "").rstrip("/") if flask_request else os.environ.get("BACKEND_URL", "").rstrip("/")
+        try:
+            base = (flask_request.url_root or "").rstrip("/")
+        except Exception:
+            base = os.environ.get("BACKEND_URL", "").rstrip("/")
         if not base:
             base = os.environ.get("BACKEND_URL", "").rstrip("/")
         return f"{base}{s}"
@@ -119,10 +125,6 @@ STABLE_HORDE_API_KEY = os.environ.get("STABLE_HORDE_API_KEY", "0000000000")
 FORCE_STABLE_HORDE = os.environ.get("FORCE_STABLE_HORDE", "false").lower() in ("1", "true", "yes")
 STABLE_HORDE_TIMEOUT = int(os.environ.get("STABLE_HORDE_TIMEOUT", "120"))
 STABLE_HORDE_POLL_INTERVAL = float(os.environ.get("STABLE_HORDE_POLL_INTERVAL", "2"))
-
-# (call_stablehorde kept mostly as-is) -- it may return data:image/... base64 strings
-# We'll post-process those later in generate_via_preferred_provider
-
 
 def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_TIMEOUT, poll_interval=STABLE_HORDE_POLL_INTERVAL):
     """
@@ -261,7 +263,7 @@ def generate_via_preferred_provider(prompt, language="en"):
     return normalized, provider
 
 
-# log model + token presence at startup (do NOT log token value)
+# ---------- LOG STARTUP ----------
 print(f"[startup] HF_MODEL = {HF_MODEL}")
 print(f"[startup] HF_API_TOKEN present: {bool(HF_API_TOKEN)}; FORCE_STABLE_HORDE={FORCE_STABLE_HORDE}; STABLE_HORDE_KEY_present={STABLE_HORDE_API_KEY != '0000000000'}")
 
@@ -319,5 +321,478 @@ AGENTS = {
 DEFAULT_AGENT_KEY = "general"
 
 
-# ---------- HELPERS ----------
-... (rest of your file unchanged) ...
+# ---------- HELPER: file parsing and saving ----------
+def extract_text_from_file(path, mimetype):
+    try:
+        if mimetype == "text/plain":
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        elif mimetype == "application/pdf":
+            text = ""
+            reader = PdfReader(path)
+            for page in reader.pages:
+                text += page.extract_text() or ""
+            return text
+        elif mimetype in (
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ):
+            doc = docx.Document(path)
+            return "\n".join([p.text for p in doc.paragraphs])
+    except Exception as e:
+        print(f"Failed to parse {path}: {e}")
+    return ""
+
+
+def save_files(files):
+    saved = []
+    for f in files:
+        if not getattr(f, "filename", None):
+            continue
+        fname = f"{uuid.uuid4().hex}_{secure_filename(f.filename)}"
+        path = os.path.join(app.config["UPLOAD_FOLDER"], fname)
+        f.save(path)
+        url = f"/uploads/{fname}"
+        text = extract_text_from_file(path, f.mimetype)
+        saved.append({
+            "name": f.filename,
+            "path": path,
+            "url": url,
+            "mimetype": f.mimetype,
+            "content": (text or "")[:8000]
+        })
+    return saved
+
+
+def auto_router(message, saved_files):
+    msg = (message or "").lower()
+    if saved_files:
+        if any(sf["content"] for sf in saved_files):
+            return "docs"
+    if any(k in msg for k in ["search", "latest", "news", "today", "google", "cite"]):
+        return "web"
+    if any(k in msg for k in ["bug", "error", "stack", "function", "class", "code", "refactor"]):
+        return "code"
+    return "general"
+
+
+def build_messages(message, agent_key, saved_files, web_results=None):
+    cfg = AGENTS.get(agent_key, AGENTS[DEFAULT_AGENT_KEY])
+    system = cfg["system"]
+    user_content = message or ""
+
+    if agent_key == "docs" and saved_files:
+        parts = []
+        for f in saved_files:
+            if f["content"]:
+                snippet = f["content"][:4000]
+                parts.append(f"--- FILE: {f['name']} ---\n{snippet}")
+        if parts:
+            user_content = (
+                f"Use ONLY these excerpts to answer. "
+                f"If insufficient, say you couldn't find it.\n\n" +
+                "\n\n".join(parts) +
+                "\n\nUSER QUESTION:\n" + (message or "")
+            )
+
+    if agent_key == "web" and web_results:
+        bullets = []
+        for i, r in enumerate(web_results, start=1):
+            bullets.append(f"[{i}] {r.get('title','')}\n{r.get('url','')}\n{r.get('snippet','')}")
+        ctx = "SOURCES:\n" + "\n\n".join(bullets)
+        user_content = (
+            f"{ctx}\n\nTASK: Answer the question. "
+            f"Summarize ONLY in bullet points with inline citations like [1], [2].\n\nUSER QUESTION:\n{message or ''}"
+        )
+
+    # 🔑 Reinforce bullet rules in every prompt
+    user_content += "\n\nRemember: Use ONLY bullet points or numbered lists. Never write paragraphs."
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content}
+    ]
+
+
+def call_together(messages, model, temperature=0.7, max_tokens=600):
+    headers = {
+        "Authorization": f"Bearer {TOGETHER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    try:
+        r = requests.post(TOGETHER_URL, headers=headers, json=payload, timeout=45)
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print("Together API error:", e)
+        traceback.print_exc()
+        return "⚠️ Sorry, I couldn’t fetch a response."
+
+
+def web_search_tavily(query, max_results=4):
+    if not TAVILY_API_KEY:
+        return []
+    try:
+        res = requests.post(
+            TAVILY_URL,
+            json={"api_key": TAVILY_API_KEY, "query": query, "max_results": max_results},
+            timeout=20,
+        )
+        res.raise_for_status()
+        data = res.json() or {}
+        items = data.get("results") or []
+        results = []
+        for it in items:
+            results.append({
+                "title": it.get("title") or "",
+                "url": it.get("url") or "",
+                "snippet": it.get("content") or it.get("snippet") or ""
+            })
+        return results
+    except Exception as e:
+        print("Tavily error:", e)
+        return []
+
+
+# ---------- Hugging Face image helper (IMPROVED & LOGGING) ----------
+def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=REQUEST_TIMEOUT):
+    """
+    Calls Hugging Face inference API robustly.
+    Returns: list of image URLs (absolute URLs under /uploads) or remote URLs.
+    Raises RuntimeError on unrecoverable error.
+    """
+    if not HF_API_TOKEN:
+        raise RuntimeError("HF_API_TOKEN not set in environment")
+
+    hf_url = f"https://api-inference.huggingface.co/models/{model}"
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Accept": "application/json",
+        "User-Agent": "BharatAI/Render"
+    }
+
+    payload = {
+        "inputs": prompt,
+        "options": {"wait_for_model": True}
+    }
+
+    backoff = [1, 2, 4, 8]
+    attempts = max_retries if max_retries > 0 else len(backoff)
+    last_exception = None
+
+    def _is_base64_string(s):
+        if not s or not isinstance(s, str):
+            return False
+        s2 = s.strip()
+        return len(s2) > 50 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r" for c in s2)
+
+    def _maybe_save_and_return_urls(strings):
+        out = []
+        for s in strings:
+            if not s or not isinstance(s, str):
+                continue
+            s = s.strip()
+            # already a URL
+            if s.startswith("http://") or s.startswith("https://"):
+                out.append(s)
+                continue
+            # data URL
+            if s.startswith("data:"):
+                try:
+                    _, b64 = s.split(",", 1)
+                    img_bytes = base64.b64decode(b64)
+                    ext = "png"
+                    m = s.split(";")[0]
+                    if "/" in m:
+                        ext = m.split("/")[1].split("+")[0]
+                    out.append(save_image_bytes_and_get_url(img_bytes, ext=ext))
+                except Exception:
+                    continue
+                continue
+            # raw base64
+            if _is_base64_string(s):
+                try:
+                    img_bytes = base64.b64decode(s)
+                    out.append(save_image_bytes_and_get_url(img_bytes, ext="png"))
+                except Exception:
+                    continue
+                continue
+        return out
+
+    for attempt in range(attempts):
+        try:
+            print(f"[HF] POST {hf_url} attempt={attempt+1}/{attempts} payload_len={len(prompt)}")
+            resp = requests.post(hf_url, json=payload, headers=headers, timeout=timeout)
+            print(f"[HF] status={resp.status_code} content-type={resp.headers.get('Content-Type')}")
+            if resp.status_code == 200:
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                if content_type.startswith("image/"):
+                    img_bytes = resp.content
+                    ext = content_type.split("/")[1].split(";")[0] or "png"
+                    return [save_image_bytes_and_get_url(img_bytes, ext=ext)]
+
+                # otherwise parse JSON or fallback text
+                try:
+                    j = resp.json()
+                except Exception:
+                    txt = resp.text or ""
+                    maybe = _maybe_save_and_return_urls([txt])
+                    if maybe:
+                        return maybe
+                    return [txt]
+
+                # collect candidate strings from common HF shapes
+                candidates = []
+                if isinstance(j, list):
+                    for it in j:
+                        if isinstance(it, str):
+                            candidates.append(it)
+                        elif isinstance(it, dict):
+                            if it.get("b64_json"):
+                                candidates.append(it["b64_json"])
+                            if it.get("url"):
+                                candidates.append(it["url"])
+                if isinstance(j, dict):
+                    if j.get("b64_json"):
+                        candidates.append(j.get("b64_json"))
+                    if j.get("url"):
+                        candidates.append(j.get("url"))
+                    if j.get("data") and isinstance(j["data"], list):
+                        for d in j["data"]:
+                            if isinstance(d, dict):
+                                if d.get("b64_json"):
+                                    candidates.append(d.get("b64_json"))
+                                if d.get("url"):
+                                    candidates.append(d.get("url"))
+                            elif isinstance(d, str):
+                                candidates.append(d)
+                    if j.get("images") and isinstance(j["images"], list):
+                        for it in j["images"]:
+                            if isinstance(it, str):
+                                candidates.append(it)
+                            elif isinstance(it, dict) and it.get("b64_json"):
+                                candidates.append(it.get("b64_json"))
+                    if j.get("result") and isinstance(j["result"], list):
+                        for it in j["result"]:
+                            if isinstance(it, dict) and it.get("img"):
+                                candidates.append(it.get("img"))
+                            elif isinstance(it, str):
+                                candidates.append(it)
+
+                urls = _maybe_save_and_return_urls(candidates)
+                if urls:
+                    return urls
+
+                # find nested http urls
+                def find_urls(obj):
+                    found = []
+                    if isinstance(obj, str) and (obj.startswith("http://") or obj.startswith("https://")):
+                        found.append(obj)
+                    elif isinstance(obj, dict):
+                        for v in obj.values():
+                            found += find_urls(v)
+                    elif isinstance(obj, list):
+                        for it in obj:
+                            found += find_urls(it)
+                    return found
+
+                found_urls = find_urls(j)
+                if found_urls:
+                    return list(dict.fromkeys(found_urls))
+
+                return [json.dumps(j)]
+
+            elif resp.status_code in (202, 503, 429):
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = resp.text
+                print(f"[HF] transient status {resp.status_code}, body: {str(body)[:300]}")
+                wait = backoff[min(attempt, len(backoff) - 1)]
+                time.sleep(wait)
+                last_exception = RuntimeError(f"HF transient status {resp.status_code}: {body}")
+                continue
+
+            else:
+                try:
+                    err = resp.json()
+                except Exception:
+                    err = resp.text
+                raise RuntimeError(f"Hugging Face error {resp.status_code}: {err}")
+
+        except requests.exceptions.RequestException as req_exc:
+            print(f"[HF] request exception: {req_exc}")
+            traceback.print_exc()
+            last_exception = req_exc
+            wait = backoff[min(attempt, len(backoff) - 1)]
+            time.sleep(wait)
+            continue
+        except Exception as exc:
+            print(f"[HF] unexpected exception: {exc}")
+            traceback.print_exc()
+            last_exception = exc
+            break
+
+    if last_exception:
+        raise RuntimeError(f"Hugging Face call failed after {attempts} attempts: {last_exception}")
+    raise RuntimeError("Hugging Face call failed for unknown reasons")
+
+
+# ---------- ROUTES ----------
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "time": datetime.datetime.utcnow().isoformat()})
+
+
+@app.route("/uploads/<path:filename>")
+def serve_upload(filename):
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=False)
+
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({"response": "⚠️ File too large. Try smaller files or compress first."}), 413
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    try:
+        is_form = bool(request.form) or bool(request.files)
+        if is_form:
+            message = request.form.get("message", "")
+            agent_in = request.form.get("agent", "auto")
+            files = request.files.getlist("files")
+        else:
+            data = request.get_json(silent=True) or {}
+            message = data.get("message", "")
+            agent_in = data.get("agent", "auto")
+            files = []
+
+        if not (message or files):
+            return jsonify({"response": "⚠️ You sent an empty request."}), 400
+
+        saved_files = save_files(files) if files else []
+        agent_key = agent_in if agent_in in AGENTS else auto_router(message, saved_files)
+
+        web_results = []
+        if agent_key == "web":
+            web_results = web_search_tavily(message)
+
+        cfg = AGENTS.get(agent_key, AGENTS[DEFAULT_AGENT_KEY])
+        msgs = build_messages(message, agent_key, saved_files, web_results)
+        reply = call_together(
+            msgs, model=cfg["model"],
+            temperature=cfg["temperature"],
+            max_tokens=cfg["max_tokens"]
+        )
+
+        images = []
+        provider_used = None
+        # 1) detect explicit user intent `/image prompt` -> generate image directly from user prompt
+        m_user_img = re.match(r"^/image\s+(.+)$", (message or "").strip(), flags=re.IGNORECASE)
+        if m_user_img:
+            img_prompt = m_user_img.group(1).strip()
+            try:
+                images, provider_used = generate_via_preferred_provider(img_prompt)
+            except Exception as e_img:
+                reply += f"\n\n[Image generation failed: {str(e_img)}]"
+
+        # 2) detect model instruction in the reply like: [generate_image: prompt]
+        if not images:
+            m = re.search(r"\[generate_image\s*:\s*(.+?)\]", reply, flags=re.IGNORECASE)
+            if m:
+                img_prompt = m.group(1).strip()
+                try:
+                    images, provider_used = generate_via_preferred_provider(img_prompt)
+                except Exception as e_img:
+                    reply += f"\n\n[Image generation failed: {str(e_img)}]"
+
+        # Append clickable links for web results
+        if agent_key == "web" and web_results:
+            src_lines = []
+            for i, r in enumerate(web_results, start=1):
+                url = r.get("url", "")
+                title = r.get("title", f"Source {i}")
+                if url:
+                    src_lines.append(f'<a href="{url}" target="_blank" rel="noopener">🔗 {title}</a>')
+            if src_lines:
+                reply += "<br><br>" + "<br>".join(src_lines)
+
+        # File chips
+        links_html = ""
+        if saved_files:
+            chips = " ".join(
+                f'<a class="file-chip" href="{f["url"]}" target="_blank" rel="noopener">{f["name"]}</a>'
+                for f in saved_files
+            )
+            links_html = f"<div class='file-chip-wrap'>{chips}</div>"
+
+        print(f">>> Agent: {agent_key}  Msg: {message[:80]!r}  Files: {len(saved_files)}  Images: {len(images)}  Provider: {provider_used}")
+        return jsonify({
+            "response": f"{reply}{links_html}",
+            "agent": agent_key,
+            "files": saved_files,
+            "images": images,
+            "provider": provider_used
+        })
+
+    except Exception as ex:
+        print("ERROR /chat:", ex)
+        traceback.print_exc()
+        return jsonify({"response": "⚠️ Server error while handling your request.", "error": str(ex)}), 500
+
+
+@app.route("/generate-image", methods=["POST"])
+def generate_image():
+    """
+    Called by frontend image button.
+    Expects JSON: { prompt: "...", language: "en" }
+    Returns: { images: [url1, ...], provider: "huggingface"|"stablehorde" }
+    """
+    try:
+        # safer JSON parsing + clear error on invalid/missing JSON
+        try:
+            body = request.get_json(silent=True)
+        except Exception as e:
+            return jsonify({"error": "invalid_json", "details": "Failed to parse JSON request body."}), 400
+
+        if not body or not isinstance(body, dict):
+            return jsonify({"error": "invalid_request", "details": "Request body must be a valid JSON object with a 'prompt' field."}), 400
+
+        prompt = (body.get("prompt") or body.get("text") or "").strip()
+        language = body.get("language", "en")
+        if not prompt:
+            return jsonify({"error": "missing_prompt"}), 400
+
+        try:
+            images, provider = generate_via_preferred_provider(prompt, language=language)
+            return jsonify({"images": images, "provider": provider})
+        except Exception as hf_err:
+            tb = traceback.format_exc()
+            # Print detailed info to logs (Render log)
+            print("ERROR generating image:", hf_err)
+            print(tb)
+            # Return helpful payload to client for debugging
+            return jsonify({
+                "error": "image_generation_failed",
+                "details": str(hf_err),
+                "traceback": tb
+            }), 500
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("generate_image top-level error:", e)
+        print(tb)
+        return jsonify({"error": "invalid_request", "details": str(e), "traceback": tb}), 500
+
+
+if __name__ == "__main__":
+    # Keep debug True locally, Render will run via gunicorn
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
