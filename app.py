@@ -1,5 +1,13 @@
 # app.py
-import os, uuid, datetime, traceback, requests, time, re, base64, json
+import os
+import uuid
+import datetime
+import traceback
+import requests
+import time
+import re
+import base64
+import json
 from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 
@@ -27,24 +35,24 @@ TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "your_key_here")
 TOGETHER_URL = os.environ.get("TOGETHER_URL", "https://api.together.xyz/v1/chat/completions")
 
 # Hugging Face image inference (set HF_API_TOKEN in your env)
-# NOTE: use an explicit public default so local dev won't accidentally call a non-existing model
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", None)
 # Default to SDXL Base model (working, inference enabled)
 HF_MODEL = os.environ.get("HF_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
 HF_MAX_RETRIES = int(os.environ.get("HF_MAX_RETRIES", "3"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "120"))
 
 # ---------- Stable Horde (fallback / alternative) ----------
 STABLE_HORDE_API_KEY = os.environ.get("STABLE_HORDE_API_KEY", "0000000000")
-FORCE_STABLE_HORDE = os.environ.get("FORCE_STABLE_HORDE", "false").lower() in ("1","true","yes")
+FORCE_STABLE_HORDE = os.environ.get("FORCE_STABLE_HORDE", "false").lower() in ("1", "true", "yes")
 STABLE_HORDE_TIMEOUT = int(os.environ.get("STABLE_HORDE_TIMEOUT", "120"))
 STABLE_HORDE_POLL_INTERVAL = float(os.environ.get("STABLE_HORDE_POLL_INTERVAL", "2"))
+
 
 def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_TIMEOUT, poll_interval=STABLE_HORDE_POLL_INTERVAL):
     """
     Submit an async generation to Stable Horde and poll until done.
     Returns a list of data URLs (data:image/png;base64,...) or raises RuntimeError.
     """
-    import uuid
     if not prompt:
         raise RuntimeError("Empty prompt for Stable Horde")
 
@@ -57,8 +65,7 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
             "cfg_scale": 7.0,
             "width": 512,
             "height": 512
-        },
-        "r2": str(uuid.uuid4())[:8]
+        }
     }
 
     try:
@@ -139,6 +146,7 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
 
     raise RuntimeError(f"Stable Horde generation timed out after {timeout}s. Last error: {last_err}")
 
+
 # wrapper that chooses provider (HF preferred unless forced off)
 def generate_via_preferred_provider(prompt, language="en"):
     """
@@ -165,6 +173,7 @@ def generate_via_preferred_provider(prompt, language="en"):
         except Exception as e:
             raise RuntimeError(f"Stable Horde failed: {e}")
 
+
 # log model + token presence at startup (do NOT log token value)
 print(f"[startup] HF_MODEL = {HF_MODEL}")
 print(f"[startup] HF_API_TOKEN present: {bool(HF_API_TOKEN)}; FORCE_STABLE_HORDE={FORCE_STABLE_HORDE}; STABLE_HORDE_KEY_present={STABLE_HORDE_API_KEY != '0000000000'}")
@@ -181,7 +190,7 @@ AGENTS = {
             "Always respond ONLY using bullet points or numbered lists. "
             "Never write paragraphs."
         ),
-        "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.7,
         "max_tokens": 600,
     },
@@ -193,7 +202,7 @@ AGENTS = {
             "Always respond in bullet points or numbered lists ONLY. "
             "Never use paragraphs."
         ),
-        "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.2,
         "max_tokens": 700,
     },
@@ -204,7 +213,7 @@ AGENTS = {
             "At the end, add clickable source links. "
             "Do NOT write paragraphs — bullet points only."
         ),
-        "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.4,
         "max_tokens": 700,
     },
@@ -215,12 +224,13 @@ AGENTS = {
             "Then explain in short bullet points. "
             "Never use long paragraphs."
         ),
-        "model":  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "temperature": 0.25,
         "max_tokens": 700,
     }
 }
 DEFAULT_AGENT_KEY = "general"
+
 
 # ---------- HELPERS ----------
 def extract_text_from_file(path, mimetype):
@@ -244,6 +254,7 @@ def extract_text_from_file(path, mimetype):
         print(f"Failed to parse {path}: {e}")
     return ""
 
+
 def save_files(files):
     saved = []
     for f in files:
@@ -263,6 +274,7 @@ def save_files(files):
         })
     return saved
 
+
 def auto_router(message, saved_files):
     msg = (message or "").lower()
     if saved_files:
@@ -273,6 +285,7 @@ def auto_router(message, saved_files):
     if any(k in msg for k in ["bug", "error", "stack", "function", "class", "code", "refactor"]):
         return "code"
     return "general"
+
 
 def build_messages(message, agent_key, saved_files, web_results=None):
     cfg = AGENTS.get(agent_key, AGENTS[DEFAULT_AGENT_KEY])
@@ -311,6 +324,7 @@ def build_messages(message, agent_key, saved_files, web_results=None):
         {"role": "user", "content": user_content}
     ]
 
+
 def call_together(messages, model, temperature=0.7, max_tokens=600):
     headers = {
         "Authorization": f"Bearer {TOGETHER_API_KEY}",
@@ -332,32 +346,9 @@ def call_together(messages, model, temperature=0.7, max_tokens=600):
         traceback.print_exc()
         return "⚠️ Sorry, I couldn’t fetch a response."
 
-def web_search_tavily(query, max_results=4):
-    if not TAVILY_API_KEY:
-        return []
-    try:
-        res = requests.post(
-            TAVILY_URL,
-            json={"api_key": TAVILY_API_KEY, "query": query, "max_results": max_results},
-            timeout=20,
-        )
-        res.raise_for_status()
-        data = res.json() or {}
-        items = data.get("results") or []
-        results = []
-        for it in items:
-            results.append({
-                "title": it.get("title") or "",
-                "url": it.get("url") or "",
-                "snippet": it.get("content") or it.get("snippet") or ""
-            })
-        return results
-    except Exception as e:
-        print("Tavily error:", e)
-        return []
 
 # ---------- Hugging Face image helper (IMPROVED & LOGGING) ----------
-def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=120):
+def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=REQUEST_TIMEOUT):
     """
     Calls Hugging Face inference API robustly.
     Returns: list of image data-URLs or remote URLs.
@@ -368,12 +359,10 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=12
 
     hf_url = f"https://api-inference.huggingface.co/models/{model}"
     headers = {
-      headers = {
-    "Authorization": f"Bearer {HF_API_TOKEN}",
-    "Accept": "application/json",   # ✅ request JSON response
-    "User-Agent": "BharatAI/Render"
-}
-
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        # Request JSON response (HF will respond with JSON or image depending on model)
+        "Accept": "application/json",
+        "User-Agent": "BharatAI/Render"
     }
 
     # Use options.wait_for_model to reduce 202 responses if model is cold
@@ -395,7 +384,7 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=12
             if resp.status_code == 200:
                 content_type = resp.headers.get("Content-Type", "")
                 # direct image bytes
-                if content_type.startswith("image/"):
+                if content_type and content_type.startswith("image/"):
                     img_bytes = resp.content
                     b64 = base64.b64encode(img_bytes).decode("utf-8")
                     data_url = f"data:{content_type};base64,{b64}"
@@ -454,7 +443,7 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=12
                 except Exception:
                     body = resp.text
                 print(f"[HF] transient status {resp.status_code}, body: {str(body)[:300]}")
-                wait = backoff[min(attempt, len(backoff)-1)]
+                wait = backoff[min(attempt, len(backoff) - 1)]
                 time.sleep(wait)
                 last_exception = RuntimeError(f"HF transient status {resp.status_code}: {body}")
                 continue
@@ -471,7 +460,7 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=12
             print(f"[HF] request exception: {req_exc}")
             traceback.print_exc()
             last_exception = req_exc
-            wait = backoff[min(attempt, len(backoff)-1)]
+            wait = backoff[min(attempt, len(backoff) - 1)]
             time.sleep(wait)
             continue
         except Exception as exc:
@@ -485,20 +474,24 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=12
         raise RuntimeError(f"Hugging Face call failed after {attempts} attempts: {last_exception}")
     raise RuntimeError("Hugging Face call failed for unknown reasons")
 
+
 # ---------- ROUTES ----------
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "time": datetime.datetime.utcnow().isoformat()})
 
+
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=False)
+
 
 @app.errorhandler(413)
 def too_large(e):
     return jsonify({"response": "⚠️ File too large. Try smaller files or compress first."}), 413
 
-@app.route("/chat", methods=["POST"]) 
+
+@app.route("/chat", methods=["POST"])
 def chat():
     try:
         is_form = bool(request.form) or bool(request.files)
@@ -581,10 +574,12 @@ def chat():
         })
 
     except Exception as ex:
-        print("ERROR /chat:", ex); traceback.print_exc()
+        print("ERROR /chat:", ex);
+        traceback.print_exc()
         return jsonify({"response": "⚠️ Server error while handling your request.", "error": str(ex)}), 500
 
-@app.route("/generate-image", methods=["POST"]) 
+
+@app.route("/generate-image", methods=["POST"])
 def generate_image():
     """
     Called by frontend image button.
@@ -626,6 +621,7 @@ def generate_image():
         print("generate_image top-level error:", e)
         print(tb)
         return jsonify({"error": "invalid_request", "details": str(e), "traceback": tb}), 500
+
 
 if __name__ == "__main__":
     # Keep debug True locally, Render will run via gunicorn
