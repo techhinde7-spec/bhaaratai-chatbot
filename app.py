@@ -368,9 +368,12 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=12
 
     hf_url = f"https://api-inference.huggingface.co/models/{model}"
     headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Accept": "image/png, application/json, application/octet-stream",
-        "User-Agent": "BharatAI/Render"
+      headers = {
+    "Authorization": f"Bearer {HF_API_TOKEN}",
+    "Accept": "application/json",   # ✅ request JSON response
+    "User-Agent": "BharatAI/Render"
+}
+
     }
 
     # Use options.wait_for_model to reduce 202 responses if model is cold
