@@ -137,9 +137,35 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
 
     raise RuntimeError(f"Stable Horde generation timed out after {timeout}s. Last error: {last_err}")
 
+# wrapper that chooses provider (HF preferred unless forced off)
+def generate_via_preferred_provider(prompt, language="en"):
+    """
+    Returns (images_list, provider_name)
+    Tries Hugging Face first (if HF_API_TOKEN present and not forced off), otherwise uses Stable Horde.
+    """
+    final_prompt = f"{prompt} (language: {language})"
+    # prefer HF unless forced off
+    if HF_API_TOKEN and not FORCE_STABLE_HORDE:
+        try:
+            imgs = call_hf_image(final_prompt)
+            return imgs, "huggingface"
+        except Exception as e:
+            print("[image] Hugging Face failed, falling back to Stable Horde:", e)
+            try:
+                imgs = call_stablehorde(final_prompt)
+                return imgs, "stablehorde"
+            except Exception as e2:
+                raise RuntimeError(f"Hugging Face failed: {e}; Stable Horde failed: {e2}")
+    else:
+        try:
+            imgs = call_stablehorde(final_prompt)
+            return imgs, "stablehorde"
+        except Exception as e:
+            raise RuntimeError(f"Stable Horde failed: {e}")
+
 # log model + token presence at startup (do NOT log token value)
 print(f"[startup] HF_MODEL = {HF_MODEL}")
-print(f"[startup] HF_API_TOKEN present: {bool(HF_API_TOKEN)}")
+print(f"[startup] HF_API_TOKEN present: {bool(HF_API_TOKEN)}; FORCE_STABLE_HORDE={FORCE_STABLE_HORDE}; STABLE_HORDE_KEY_present={STABLE_HORDE_API_KEY != '0000000000'}")
 
 # Optional Web Search (Tavily). Set env: TAVILY_API_KEY
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
@@ -467,7 +493,7 @@ def serve_upload(filename):
 def too_large(e):
     return jsonify({"response": "⚠️ File too large. Try smaller files or compress first."}), 413
 
-@app.route("/chat", methods=["POST"])
+@app.route("/chat", methods=["POST"]) 
 def chat():
     try:
         is_form = bool(request.form) or bool(request.files)
@@ -500,12 +526,13 @@ def chat():
         )
 
         images = []
+        provider_used = None
         # 1) detect explicit user intent `/image prompt` -> generate image directly from user prompt
         m_user_img = re.match(r"^/image\s+(.+)$", (message or "").strip(), flags=re.IGNORECASE)
         if m_user_img:
             img_prompt = m_user_img.group(1).strip()
             try:
-                images = call_hf_image(img_prompt)
+                images, provider_used = generate_via_preferred_provider(img_prompt)
             except Exception as e_img:
                 reply += f"\n\n[Image generation failed: {str(e_img)}]"
 
@@ -515,7 +542,7 @@ def chat():
             if m:
                 img_prompt = m.group(1).strip()
                 try:
-                    images = call_hf_image(img_prompt)
+                    images, provider_used = generate_via_preferred_provider(img_prompt)
                 except Exception as e_img:
                     reply += f"\n\n[Image generation failed: {str(e_img)}]"
 
@@ -539,36 +566,44 @@ def chat():
             )
             links_html = f"<div class='file-chip-wrap'>{chips}</div>"
 
-        print(f">>> Agent: {agent_key}  Msg: {message[:80]!r}  Files: {len(saved_files)}  Images: {len(images)}")
+        print(f">>> Agent: {agent_key}  Msg: {message[:80]!r}  Files: {len(saved_files)}  Images: {len(images)}  Provider: {provider_used}")
         return jsonify({
             "response": f"{reply}{links_html}",
             "agent": agent_key,
             "files": saved_files,
-            "images": images
+            "images": images,
+            "provider": provider_used
         })
 
     except Exception as ex:
         print("ERROR /chat:", ex); traceback.print_exc()
         return jsonify({"response": "⚠️ Server error while handling your request.", "error": str(ex)}), 500
 
-@app.route("/generate-image", methods=["POST"])
+@app.route("/generate-image", methods=["POST"]) 
 def generate_image():
     """
     Called by frontend image button.
     Expects JSON: { prompt: "...", language: "en" }
-    Returns: { images: [dataUrl1, ...], model: HF_MODEL }
+    Returns: { images: [dataUrl1, ...], provider: "huggingface"|"stablehorde" }
     """
     try:
-        body = request.get_json(force=True)
+        # safer JSON parsing + clear error on invalid/missing JSON
+        try:
+            body = request.get_json(silent=True)
+        except Exception as e:
+            return jsonify({"error": "invalid_json", "details": "Failed to parse JSON request body."}), 400
+
+        if not body or not isinstance(body, dict):
+            return jsonify({"error": "invalid_request", "details": "Request body must be a valid JSON object with a 'prompt' field."}), 400
+
         prompt = (body.get("prompt") or body.get("text") or "").strip()
         language = body.get("language", "en")
         if not prompt:
             return jsonify({"error": "missing_prompt"}), 400
 
-        final_prompt = f"{prompt} (language: {language})"
         try:
-            images = call_hf_image(final_prompt)
-            return jsonify({"images": images, "model": HF_MODEL})
+            images, provider = generate_via_preferred_provider(prompt, language=language)
+            return jsonify({"images": images, "provider": provider})
         except Exception as hf_err:
             tb = traceback.format_exc()
             # Print detailed info to logs (Render log)
