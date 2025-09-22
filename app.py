@@ -319,24 +319,23 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
 # ---------- Hugging Face image helper (IMPROVED & LOGGING) ----------
 def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=REQUEST_TIMEOUT):
     """
-    Calls Hugging Face inference API robustly.
-    Returns: list of image URLs (absolute URLs under /uploads) or remote URLs.
-    Raises RuntimeError on unrecoverable error.
+    Calls Hugging Face Inference API for image generation.
+    - If the model returns image bytes directly (Content-Type image/*) we save them and return a URL.
+    - If the model returns JSON containing base64 or urls, we extract those and save/normalize.
+    Returns: list of absolute image URLs (or remote urls) or raises RuntimeError.
     """
     if not HF_API_TOKEN:
         raise RuntimeError("HF_API_TOKEN not set in environment")
 
     hf_url = f"https://api-inference.huggingface.co/models/{model}"
+    # NOTE: we do not force Accept to image/png only, because some models return JSON.
     headers = {
         "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Accept": "application/json",
+        "Accept": "application/json, image/png, image/jpeg, image/webp",
         "User-Agent": "BharatAI/Render"
     }
 
-    payload = {
-        "inputs": prompt,
-        "options": {"wait_for_model": True}
-    }
+    payload = {"inputs": prompt, "options": {"wait_for_model": True}}
 
     backoff = [1, 2, 4, 8]
     attempts = max_retries if max_retries > 0 else len(backoff)
@@ -348,132 +347,142 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
         s2 = s.strip()
         return len(s2) > 50 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r" for c in s2)
 
-    def _maybe_save_and_return_urls(strings):
-        out = []
-        for s in strings:
+    def _save_bytes_and_url(img_bytes, content_type):
+        # determine extension
+        ext = "png"
+        try:
+            if "/" in content_type:
+                ext = content_type.split("/")[1].split(";")[0]
+        except Exception:
+            ext = "png"
+        return save_image_bytes_and_get_url(img_bytes, ext=ext)
+
+    def _try_extract_and_save_from_json(j):
+        # j may be dict, list, etc.
+        candidates = []
+
+        if isinstance(j, dict):
+            # common fields
+            for k in ("b64_json", "img", "image", "url", "data"):
+                v = j.get(k)
+                if isinstance(v, str):
+                    candidates.append(v)
+                elif isinstance(v, list):
+                    for it in v:
+                        if isinstance(it, str):
+                            candidates.append(it)
+                        elif isinstance(it, dict):
+                            # nested
+                            if it.get("b64_json"):
+                                candidates.append(it.get("b64_json"))
+                            if it.get("url"):
+                                candidates.append(it.get("url"))
+            # possibly j["data"] is [{b64_json:...}, ...]
+            if j.get("data") and isinstance(j["data"], list):
+                for d in j["data"]:
+                    if isinstance(d, dict):
+                        if d.get("b64_json"):
+                            candidates.append(d.get("b64_json"))
+                        if d.get("url"):
+                            candidates.append(d.get("url"))
+        elif isinstance(j, list):
+            for it in j:
+                if isinstance(it, str):
+                    candidates.append(it)
+                elif isinstance(it, dict):
+                    for k in ("b64_json", "img", "image", "url"):
+                        if it.get(k):
+                            candidates.append(it.get(k))
+
+        # normalize & save
+        urls = []
+        for s in candidates:
             if not s or not isinstance(s, str):
                 continue
             s = s.strip()
-            # already a URL
             if s.startswith("http://") or s.startswith("https://"):
-                out.append(s)
+                urls.append(s)
                 continue
-            # data URL
             if s.startswith("data:"):
                 try:
                     _, b64 = s.split(",", 1)
                     img_bytes = base64.b64decode(b64)
-                    ext = "png"
-                    m = s.split(";")[0]
-                    if "/" in m:
-                        ext = m.split("/")[1].split("+")[0]
-                    out.append(save_image_bytes_and_get_url(img_bytes, ext=ext))
-                except Exception:
+                    urls.append(_save_bytes_and_url(img_bytes, s.split(";")[0].split(":")[1] if ";" in s else "image/png"))
                     continue
-                continue
-            # raw base64
+                except Exception:
+                    pass
             if _is_base64_string(s):
                 try:
                     img_bytes = base64.b64decode(s)
-                    out.append(save_image_bytes_and_get_url(img_bytes, ext="png"))
-                except Exception:
+                    urls.append(_save_bytes_and_url(img_bytes, "image/png"))
                     continue
-                continue
-        return out
+                except Exception:
+                    pass
+        # dedupe preserve order
+        return list(dict.fromkeys(urls))
 
     for attempt in range(attempts):
         try:
-            print(f"[HF] POST {hf_url} attempt={attempt+1}/{attempts} payload_len={len(prompt)}")
+            print(f"[HF] POST {hf_url} attempt={attempt+1}/{attempts} prompt_len={len(prompt)}")
             resp = requests.post(hf_url, json=payload, headers=headers, timeout=timeout)
-            print(f"[HF] status={resp.status_code} content-type={resp.headers.get('Content-Type')}")
-            if resp.status_code == 200:
-                content_type = (resp.headers.get("Content-Type") or "").lower()
-                if content_type.startswith("image/"):
-                    img_bytes = resp.content
-                    ext = content_type.split("/")[1].split(";")[0] or "png"
-                    return [save_image_bytes_and_get_url(img_bytes, ext=ext)]
+            status = resp.status_code
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            print(f"[HF] status={status} content-type={ctype}")
 
-                # otherwise parse JSON or fallback text
+            if status == 200:
+                # direct image bytes (some models return image bytes)
+                if ctype.startswith("image/"):
+                    img_bytes = resp.content
+                    return [_save_bytes_and_url(img_bytes, ctype)]
+
+                # else try parse JSON
                 try:
                     j = resp.json()
                 except Exception:
                     txt = resp.text or ""
-                    maybe = _maybe_save_and_return_urls([txt])
-                    if maybe:
-                        return maybe
+                    # maybe raw base64 in text
+                    if _is_base64_string(txt):
+                        img_bytes = base64.b64decode(txt)
+                        return [_save_bytes_and_url(img_bytes, "image/png")]
+                    # fallback: return textual body as a single item
                     return [txt]
 
-                # collect candidate strings from common HF shapes
-                candidates = []
-                if isinstance(j, list):
-                    for it in j:
-                        if isinstance(it, str):
-                            candidates.append(it)
-                        elif isinstance(it, dict):
-                            if it.get("b64_json"):
-                                candidates.append(it["b64_json"])
-                            if it.get("url"):
-                                candidates.append(it["url"])
-                if isinstance(j, dict):
-                    if j.get("b64_json"):
-                        candidates.append(j.get("b64_json"))
-                    if j.get("url"):
-                        candidates.append(j.get("url"))
-                    if j.get("data") and isinstance(j["data"], list):
-                        for d in j["data"]:
-                            if isinstance(d, dict):
-                                if d.get("b64_json"):
-                                    candidates.append(d.get("b64_json"))
-                                if d.get("url"):
-                                    candidates.append(d.get("url"))
-                            elif isinstance(d, str):
-                                candidates.append(d)
-                    if j.get("images") and isinstance(j["images"], list):
-                        for it in j["images"]:
-                            if isinstance(it, str):
-                                candidates.append(it)
-                            elif isinstance(it, dict) and it.get("b64_json"):
-                                candidates.append(it.get("b64_json"))
-                    if j.get("result") and isinstance(j["result"], list):
-                        for it in j["result"]:
-                            if isinstance(it, dict) and it.get("img"):
-                                candidates.append(it.get("img"))
-                            elif isinstance(it, str):
-                                candidates.append(it)
-
-                urls = _maybe_save_and_return_urls(candidates)
+                # attempt to extract images from JSON
+                urls = _try_extract_and_save_from_json(j)
                 if urls:
                     return urls
 
-                # find nested http urls
-                def find_urls(obj):
+                # find http urls nested anywhere in the JSON
+                def find_http_urls(obj):
                     found = []
                     if isinstance(obj, str) and (obj.startswith("http://") or obj.startswith("https://")):
                         found.append(obj)
                     elif isinstance(obj, dict):
                         for v in obj.values():
-                            found += find_urls(v)
+                            found += find_http_urls(v)
                     elif isinstance(obj, list):
                         for it in obj:
-                            found += find_urls(it)
+                            found += find_http_urls(it)
                     return found
 
-                found_urls = find_urls(j)
-                if found_urls:
-                    # dedupe preserve order
-                    return list(dict.fromkeys(found_urls))
+                found = find_http_urls(j)
+                if found:
+                    # dedupe
+                    return list(dict.fromkeys(found))
 
+                # nothing extractable - return JSON string (caller will inspect)
                 return [json.dumps(j)]
 
-            elif resp.status_code in (202, 503, 429):
+            # transient statuses - retry with backoff
+            elif status in (202, 429, 503):
                 try:
                     body = resp.json()
                 except Exception:
                     body = resp.text
-                print(f"[HF] transient status {resp.status_code}, body: {str(body)[:300]}")
+                print(f"[HF] transient status {status}: {str(body)[:300]}")
                 wait = backoff[min(attempt, len(backoff) - 1)]
+                last_exception = RuntimeError(f"HF transient status {status}: {body}")
                 time.sleep(wait)
-                last_exception = RuntimeError(f"HF transient status {resp.status_code}: {body}")
                 continue
 
             else:
@@ -481,7 +490,7 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
                     err = resp.json()
                 except Exception:
                     err = resp.text
-                raise RuntimeError(f"Hugging Face error {resp.status_code}: {err}")
+                raise RuntimeError(f"Hugging Face error {status}: {err}")
 
         except requests.exceptions.RequestException as req_exc:
             print(f"[HF] request exception: {req_exc}")
@@ -496,41 +505,10 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
             last_exception = exc
             break
 
+    # after attempts
     if last_exception:
         raise RuntimeError(f"Hugging Face call failed after {attempts} attempts: {last_exception}")
     raise RuntimeError("Hugging Face call failed for unknown reasons")
-
-# wrapper that chooses provider (HF preferred unless forced off)
-def generate_via_preferred_provider(prompt, language="en"):
-    """
-    Returns (images_list, provider_name)
-    Tries Hugging Face first (if HF_API_TOKEN present and not forced off), otherwise uses Stable Horde.
-    Ensures returned image strings are absolute URLs that frontend can fetch.
-    """
-    final_prompt = f"{prompt} (language: {language})"
-    # prefer HF unless forced off
-    if HF_API_TOKEN and not FORCE_STABLE_HORDE:
-        try:
-            imgs = call_hf_image(final_prompt)
-            provider = "huggingface"
-        except Exception as e:
-            print("[image] Hugging Face failed, falling back to Stable Horde:", e)
-            try:
-                imgs = call_stablehorde(final_prompt)
-                provider = "stablehorde"
-            except Exception as e2:
-                raise RuntimeError(f"Hugging Face failed: {e}; Stable Horde failed: {e2}")
-    else:
-        try:
-            imgs = call_stablehorde(final_prompt)
-            provider = "stablehorde"
-        except Exception as e:
-            raise RuntimeError(f"Stable Horde failed: {e}")
-
-    # Convert any data/base64 strings to saved upload URLs where possible
-    normalized = _ensure_saved_urls_from_list(imgs or [])
-    return normalized, provider
-
 # ---------- LOG STARTUP ----------
 print(f"[startup] HF_MODEL = {HF_MODEL}")
 print(f"[startup] HF_API_TOKEN present: {bool(HF_API_TOKEN)}; FORCE_STABLE_HORDE={FORCE_STABLE_HORDE}; STABLE_HORDE_KEY_present={STABLE_HORDE_API_KEY != '0000000000'}")
