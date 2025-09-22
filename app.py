@@ -27,9 +27,14 @@ TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "your_key_here")
 TOGETHER_URL = os.environ.get("TOGETHER_URL", "https://api.together.xyz/v1/chat/completions")
 
 # Hugging Face image inference (set HF_API_TOKEN in your env)
+# NOTE: use an explicit public default so local dev won't accidentally call a non-existing model
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", None)
-HF_MODEL = os.environ.get("HF_MODEL", "stabilityai/stable-diffusion-2")
+HF_MODEL = os.environ.get("HF_MODEL", "runwayml/stable-diffusion-v1-5")
 HF_MAX_RETRIES = int(os.environ.get("HF_MAX_RETRIES", "3"))
+
+# log model + token presence at startup (do NOT log token value)
+print(f"[startup] HF_MODEL = {HF_MODEL}")
+print(f"[startup] HF_API_TOKEN present: {bool(HF_API_TOKEN)}")
 
 # Optional Web Search (Tavily). Set env: TAVILY_API_KEY
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
