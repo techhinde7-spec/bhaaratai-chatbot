@@ -215,7 +215,7 @@ HF_MODEL = os.environ.get("HF_MODEL", "stabilityai/stable-diffusion-xl-base-1.0"
 HF_MAX_RETRIES = int(os.environ.get("HF_MAX_RETRIES", "3"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "120"))
 
-STABLE_HORDE_API_KEY = os.environ.get("STABLE_HORDE_API_KEY", "0000000000")
+STABLE_HORDE_API_KEY = os.environ.get("STABLE_HORDE_API_KEY", "DFaIYSMepfwCWy2IJ_qmJQ")
 FORCE_STABLE_HORDE = os.environ.get("FORCE_STABLE_HORDE", "false").lower() in ("1", "true", "yes")
 STABLE_HORDE_TIMEOUT = int(os.environ.get("STABLE_HORDE_TIMEOUT", "120"))
 STABLE_HORDE_POLL_INTERVAL = float(os.environ.get("STABLE_HORDE_POLL_INTERVAL", "2"))
