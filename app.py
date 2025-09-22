@@ -23,7 +23,7 @@ app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_DIR
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
-# sometimes we need request.url_root while inside helpers; import alias
+# alias to use url_root inside helpers
 from flask import request as flask_request
 
 # ---------- Small helpers to save images & build URLs ----------
@@ -100,98 +100,131 @@ def ensure_absolute_url(s):
         return save_base64_and_return_url(candidate)
     return s
 
-# ---------- New helper: normalize / persist returned image entries ----------
 def normalize_image_entry(entry):
     """
     Accepts: string or dict or list. Returns an absolute URL the frontend can fetch,
     or None if it can't be normalized.
-    Uses ensure_absolute_url and save_base64_and_return_url helpers defined above.
     """
     try:
-        # If it's already a URL or data:... or base64 string, ensure_absolute_url will handle.
         if isinstance(entry, str):
             s = entry.strip()
-
-            # If string looks like a JSON-encoded object, parse and try to extract b64/url
+            # Try JSON parse if looks like JSON string
             if s.startswith("{") and s.endswith("}"):
                 try:
                     parsed = json.loads(s)
-                    # prefer b64_json, img, image, url fields
+                    # prefer commonly used fields
                     for key in ("b64_json", "img", "image", "data", "url"):
-                        if key in parsed and isinstance(parsed[key], str) and parsed[key].strip():
-                            candidate = parsed[key].strip()
-                            maybe = normalize_image_entry(candidate)
+                        val = parsed.get(key)
+                        if isinstance(val, str) and val.strip():
+                            maybe = normalize_image_entry(val)
                             if maybe:
                                 return maybe
-                    # fallback: scan values for a long base64-like string
+                    # scan values for long base64-like strings
                     for v in parsed.values():
                         if isinstance(v, str) and len(v) > 60 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", v.replace("\n","").replace("\r","")):
                             return save_base64_and_return_url(v)
                 except Exception:
-                    # not valid JSON, fall through to base64 checks
                     pass
-
-            # If it's data:...base64, or raw base64, pass to ensure_absolute_url (which saves)
-            try:
-                maybe = ensure_absolute_url(s)
-                if maybe:
-                    return maybe
-            except Exception as e:
-                print("[normalize_image_entry] ensure_absolute_url failed:", e)
-
-            return None
-
-        # If it's a dict with expected fields
+            maybe = ensure_absolute_url(s)
+            return maybe
         if isinstance(entry, dict):
             for key in ("b64_json", "img", "image", "data", "url"):
                 if key in entry and isinstance(entry[key], str) and entry[key].strip():
                     maybe = normalize_image_entry(entry[key].strip())
                     if maybe:
                         return maybe
-            # if nested: try converting dict -> json -> string handling
+            # nested dict -> stringify and try
             try:
-                text = json.dumps(entry)
-                return normalize_image_entry(text)
+                txt = json.dumps(entry)
+                return normalize_image_entry(txt)
             except Exception:
                 pass
-
-        # arrays: try first element
-        if isinstance(entry, (list, tuple)) and entry:
+        if isinstance(entry, list) and entry:
             return normalize_image_entry(entry[0])
-
     except Exception as exc:
         print("[normalize_image_entry] unexpected:", exc)
     return None
 
-# CORS
+def _ensure_saved_urls_from_list(items):
+    """
+    Convert any data: or base64 entries in a provider response into saved file URLs.
+    Returns list of absolute URLs (or original entries if not convertible).
+    """
+    out = []
+    for it in (items or []):
+        try:
+            if not it:
+                continue
+            if isinstance(it, str):
+                s = it.strip()
+                # data URL
+                if s.startswith("data:"):
+                    url = save_base64_and_return_url(s)
+                    if url:
+                        out.append(url)
+                        continue
+                # raw base64 heuristic
+                cand = s.replace("\n","").replace("\r","")
+                if len(cand) > 60 and re.fullmatch(r"[A-Za-z0-9+/=]+", cand):
+                    url = save_base64_and_return_url(cand)
+                    if url:
+                        out.append(url)
+                        continue
+                # absolute http(s)
+                if re.match(r"^https?://", s, flags=re.IGNORECASE):
+                    out.append(s)
+                    continue
+                # relative uploads path
+                if s.startswith("/uploads/"):
+                    try:
+                        base = (flask_request.url_root or "").rstrip("/")
+                    except Exception:
+                        base = os.environ.get("BACKEND_URL", "").rstrip("/")
+                    if base:
+                        out.append(base + s)
+                        continue
+                # try normalize (covers JSON-encoded strings, etc.)
+                maybe = normalize_image_entry(s)
+                if maybe:
+                    out.append(maybe)
+                    continue
+                # fallback keep original
+                out.append(s)
+            else:
+                # dict/list
+                maybe = normalize_image_entry(it)
+                out.append(maybe or it)
+        except Exception as e:
+            print("[_ensure_saved_urls_from_list] error:", e)
+            out.append(it)
+    return out
+
+# ---------- CORS ----------
 try:
     from flask_cors import CORS
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 except Exception:
     pass
 
-# LLM (Together)
+# ---------- PROVIDER CONFIG ----------
 TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "your_key_here")
 TOGETHER_URL = os.environ.get("TOGETHER_URL", "https://api.together.xyz/v1/chat/completions")
 
-# Hugging Face image inference (set HF_API_TOKEN in your env)
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", None)
-# Default to SDXL Base model (working, inference enabled)
 HF_MODEL = os.environ.get("HF_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
 HF_MAX_RETRIES = int(os.environ.get("HF_MAX_RETRIES", "3"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "120"))
 
-# ---------- Stable Horde (fallback / alternative) ----------
 STABLE_HORDE_API_KEY = os.environ.get("STABLE_HORDE_API_KEY", "0000000000")
 FORCE_STABLE_HORDE = os.environ.get("FORCE_STABLE_HORDE", "false").lower() in ("1", "true", "yes")
 STABLE_HORDE_TIMEOUT = int(os.environ.get("STABLE_HORDE_TIMEOUT", "120"))
 STABLE_HORDE_POLL_INTERVAL = float(os.environ.get("STABLE_HORDE_POLL_INTERVAL", "2"))
 
-
+# ---------- Stable Horde (fallback) ----------
 def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_TIMEOUT, poll_interval=STABLE_HORDE_POLL_INTERVAL):
     """
-    Submit an async generation to Stable Horde and poll until done.
-    Returns a list of data URLs (data:image/png;base64,...) or raises RuntimeError.
+    Submit async generation to Stable Horde and poll until done.
+    Returns list of data URLs or http URLs.
     """
     if not prompt:
         raise RuntimeError("Empty prompt for Stable Horde")
@@ -225,10 +258,8 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
     except Exception:
         raise RuntimeError("Stable Horde submit: failed to parse JSON response")
 
-    # job id detection (API shapes vary)
     job_id = job.get("id") or job.get("request_id") or job.get("job_id") or job.get("requestUUID")
     if not job_id:
-        # sometimes images are returned immediately
         if isinstance(job, dict) and job.get("images"):
             out = []
             for it in job["images"]:
@@ -256,7 +287,6 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
             time.sleep(poll_interval)
             continue
 
-        # finished detection
         if status.get("done") or status.get("finished") or status.get("status") == "done":
             images = []
             if isinstance(status, dict):
@@ -285,7 +315,6 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
         time.sleep(poll_interval)
 
     raise RuntimeError(f"Stable Horde generation timed out after {timeout}s. Last error: {last_err}")
-
 
 # ---------- Hugging Face image helper (IMPROVED & LOGGING) ----------
 def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=REQUEST_TIMEOUT):
@@ -431,6 +460,7 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
 
                 found_urls = find_urls(j)
                 if found_urls:
+                    # dedupe preserve order
                     return list(dict.fromkeys(found_urls))
 
                 return [json.dumps(j)]
@@ -497,14 +527,8 @@ def generate_via_preferred_provider(prompt, language="en"):
         except Exception as e:
             raise RuntimeError(f"Stable Horde failed: {e}")
 
-    # Normalize images into absolute URLs where possible
-    normalized = []
-    for it in imgs:
-        try:
-            u = ensure_absolute_url(it)
-            normalized.append(u or it)
-        except Exception:
-            normalized.append(it)
+    # Convert any data/base64 strings to saved upload URLs where possible
+    normalized = _ensure_saved_urls_from_list(imgs or [])
     return normalized, provider
 
 # ---------- LOG STARTUP ----------
@@ -515,7 +539,7 @@ print(f"[startup] HF_API_TOKEN present: {bool(HF_API_TOKEN)}; FORCE_STABLE_HORDE
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 TAVILY_URL = os.environ.get("TAVILY_URL", "https://api.tavily.com/search")
 
-# ---------- AGENT CONFIG (STRICT bullet rules) ----------
+# ---------- AGENT CONFIG (unchanged) ----------
 AGENTS = {
     "general": {
         "system": (
@@ -564,7 +588,7 @@ AGENTS = {
 }
 DEFAULT_AGENT_KEY = "general"
 
-# ---------- HELPER: file parsing and saving ----------
+# ---------- Helpers for files, parsing, chat endpoints (kept concise) ----------
 def extract_text_from_file(path, mimetype):
     try:
         if mimetype == "text/plain":
@@ -645,7 +669,6 @@ def build_messages(message, agent_key, saved_files, web_results=None):
             f"Summarize ONLY in bullet points with inline citations like [1], [2].\n\nUSER QUESTION:\n{message or ''}"
         )
 
-    # 🔑 Reinforce bullet rules in every prompt
     user_content += "\n\nRemember: Use ONLY bullet points or numbered lists. Never write paragraphs."
 
     return [
@@ -745,7 +768,7 @@ def chat():
 
         images = []
         provider_used = None
-        # 1) detect explicit user intent `/image prompt` -> generate image directly from user prompt
+        # 1) detect explicit user intent `/image prompt`
         m_user_img = re.match(r"^/image\s+(.+)$", (message or "").strip(), flags=re.IGNORECASE)
         if m_user_img:
             img_prompt = m_user_img.group(1).strip()
@@ -798,7 +821,6 @@ def chat():
         traceback.print_exc()
         return jsonify({"response": "⚠️ Server error while handling your request.", "error": str(ex)}), 500
 
-# ---------- Single generate-image route (only one) ----------
 @app.route("/generate-image", methods=["POST"])
 def generate_image():
     """
@@ -820,7 +842,6 @@ def generate_image():
         if not prompt:
             return jsonify({"error": "missing_prompt"}), 400
 
-        # call provider(s)
         try:
             images, provider = generate_via_preferred_provider(prompt, language=language)
         except Exception as hf_err:
@@ -833,24 +854,23 @@ def generate_image():
                 "traceback": tb
             }), 500
 
-        # Normalize/convert each returned image entry into an absolute URL where possible
+        # If anything looks like a relative / data / base64, ensure absolute fetchable URLs
         normalized = []
         for it in (images or []):
+            url = None
             try:
                 url = normalize_image_entry(it)
-                if url:
-                    normalized.append(url)
+            except Exception:
+                url = None
+            if url:
+                normalized.append(url)
+            else:
+                # fallback try ensure_absolute_url for strings
+                if isinstance(it, str):
+                    fallback = ensure_absolute_url(it)
+                    normalized.append(fallback or it)
                 else:
-                    # last-resort: attempt ensure_absolute_url (may return same or None)
-                    fallback = ensure_absolute_url(it) if isinstance(it, str) else None
-                    if fallback:
-                        normalized.append(fallback)
-                    else:
-                        # include raw item so frontend can inspect error shapes
-                        normalized.append(it)
-            except Exception as e:
-                print("[generate-image] normalization failed for entry:", e)
-                normalized.append(it)
+                    normalized.append(it)
 
         return jsonify({"images": normalized, "provider": provider})
 
@@ -863,4 +883,3 @@ def generate_image():
 if __name__ == "__main__":
     # Keep debug True locally, Render will run via gunicorn
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
-
