@@ -29,8 +29,10 @@ TOGETHER_URL = os.environ.get("TOGETHER_URL", "https://api.together.xyz/v1/chat/
 # Hugging Face image inference (set HF_API_TOKEN in your env)
 # NOTE: use an explicit public default so local dev won't accidentally call a non-existing model
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", None)
-HF_MODEL = os.environ.get("HF_MODEL", "runwayml/stable-diffusion-v1-5")
+# Default to SDXL Base model (working, inference enabled)
+HF_MODEL = os.environ.get("HF_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
 HF_MAX_RETRIES = int(os.environ.get("HF_MAX_RETRIES", "3"))
+
 # ---------- Stable Horde (fallback / alternative) ----------
 STABLE_HORDE_API_KEY = os.environ.get("STABLE_HORDE_API_KEY", "0000000000")
 FORCE_STABLE_HORDE = os.environ.get("FORCE_STABLE_HORDE", "false").lower() in ("1","true","yes")
