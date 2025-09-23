@@ -23,6 +23,22 @@ app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_DIR
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
+from flask_cors import CORS
+
+# Replace with the exact origin(s) your frontend uses
+FRONTEND_ORIGINS = [
+    "https://bhaaratai.in",
+    "https://www.bhaaratai.in"
+]
+
+# Apply CORS to the whole app but restrict to allowed origins
+CORS(app,
+     origins=FRONTEND_ORIGINS,
+     supports_credentials=False,
+     allow_headers=["Content-Type", "Authorization", "apikey", "X-Requested-With"],
+     methods=["GET", "POST", "OPTIONS"])
+
+
 # alias to use url_root inside helpers
 from flask import request as flask_request
 
