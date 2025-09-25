@@ -397,6 +397,133 @@ def stablehorde_get_status(job_id, api_key=STABLE_HORDE_API_KEY):
         except Exception:
             return {"error": "unknown error", "status_code": r.status_code}
     return r.json()
+def call_stablehorde_img2img(prompt, source_image_b64, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_TIMEOUT, poll_interval=STABLE_HORDE_POLL_INTERVAL, params=None):
+    """
+    Submit an img2img (inpainting / img2img) async generation request to Stable Horde and poll until done.
+    - source_image_b64: data:image/*;base64,... OR raw base64 string
+    - params: dict with keys like steps, cfg_scale, denoising_strength, width, height, sampler, model, etc.
+    Returns list of data URLs or http URLs.
+    """
+    if not prompt:
+        raise RuntimeError("Empty prompt for Stable Horde img2img")
+    if not source_image_b64:
+        raise RuntimeError("source_image missing for img2img")
+
+    submit_url = "https://stablehorde.net/api/v2/generate/async"
+    headers = {"apikey": api_key, "Content-Type": "application/json"}
+
+    # normalize base64 - ensure it's just the base64 part or data:... form
+    src = source_image_b64.strip()
+    # If it is a data URL keep it, else if it looks like raw base64 prefix it
+    if not src.startswith("data:"):
+        # Try to be generous: if it has newlines, remove them
+        cand = src.replace("\n", "").replace("\r", "")
+        if cand.startswith("iVBOR") or cand.startswith("/9j/"):  # png/jpg base64 starts
+            src = "data:image/png;base64," + cand
+        else:
+            # otherwise try to use as-is
+            src = cand
+
+    payload = {
+        "prompt": prompt,
+        "params": {
+            "steps": 30,
+            "cfg_scale": 7.0,
+            "width": 512,
+            "height": 512
+        },
+        # include the source image base64 as 'source_image' (Stable Horde accepts similar key in many clients)
+        "source_image": src,
+        # indicate we want img2img mode if supported
+        "type": "img2img"
+    }
+
+    # merge user params if provided
+    if params and isinstance(params, dict):
+        payload_params = payload.get("params", {})
+        payload_params.update({k: v for k, v in params.items() if k is not None})
+        payload["params"] = payload_params
+
+    try:
+        r = requests.post(submit_url, json=payload, headers=headers, timeout=30)
+    except Exception as e:
+        raise RuntimeError(f"Stable Horde img2img submit failed: {e}")
+
+    if r.status_code >= 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        raise RuntimeError(f"Stable Horde img2img submit error {r.status_code}: {body}")
+
+    try:
+        job = r.json()
+    except Exception:
+        raise RuntimeError("Stable Horde img2img submit: failed to parse JSON response")
+
+    job_id = job.get("id") or job.get("request_id") or job.get("job_id") or job.get("requestUUID")
+    if not job_id:
+        # fallback: maybe immediate images returned in response
+        out = []
+        if isinstance(job, dict):
+            if job.get("images"):
+                for it in job["images"]:
+                    if isinstance(it, dict) and it.get("img"):
+                        out.append("data:image/png;base64," + it["img"])
+                    elif isinstance(it, str) and it.startswith("http"):
+                        out.append(it)
+        if out:
+            return out
+        raise RuntimeError(f"Stable Horde img2img submit: no job id in response: {job}")
+
+    check_url = f"https://stablehorde.net/api/v2/generate/check/{job_id}"
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            s = requests.get(check_url, headers=headers, timeout=30)
+            if s.status_code != 200:
+                last_err = f"check returned {s.status_code}: {s.text[:200]}"
+                time.sleep(poll_interval)
+                continue
+            status = s.json()
+        except Exception as e:
+            last_err = f"poll exception: {e}"
+            time.sleep(poll_interval)
+            continue
+
+        if status.get("done") or status.get("finished") or status.get("status") == "done":
+            images = []
+            if isinstance(status, dict):
+                if status.get("images") and isinstance(status["images"], list):
+                    for it in status["images"]:
+                        if isinstance(it, dict) and it.get("img"):
+                            images.append("data:image/png;base64," + it["img"])
+                        elif isinstance(it, str):
+                            if it.startswith("http"):
+                                images.append(it)
+                            else:
+                                images.append("data:image/png;base64," + it)
+                if status.get("generations") and isinstance(status["generations"], list):
+                    for g in status["generations"]:
+                        if isinstance(g, dict) and g.get("img"):
+                            images.append("data:image/png;base64," + g["img"])
+                if status.get("result") and isinstance(status["result"], list):
+                    for it in status["result"]:
+                        if isinstance(it, dict) and it.get("img"):
+                            images.append("data:image/png;base64," + it["img"])
+            images = [i for i in images if i]
+            if images:
+                return images
+            raise RuntimeError(f"Stable Horde img2img finished but returned no images: {status}")
+
+        time.sleep(poll_interval)
+
+    raise RuntimeError(f"Stable Horde img2img timed out after {timeout}s. Last error: {last_err}")
+
+
+
+
 
 # ---------- Hugging Face image helper (IMPROVED & LOGGING) ----------
 def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=REQUEST_TIMEOUT):
