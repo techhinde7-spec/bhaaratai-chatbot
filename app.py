@@ -1093,9 +1093,14 @@ def generate_image():
         if not prompt:
             return jsonify({"error": "missing_prompt"}), 400
 
+               # read optional source_image or params from request
+        source_image = body.get("source_image") or body.get("image") or body.get("img")
+        img2img_params = body.get("params") or body.get("img2img_params") or None
+
         try:
-            images, provider = generate_via_preferred_provider(prompt, language=language)
+            images, provider = generate_via_preferred_provider(prompt, language=language, source_image=source_image, img2img_params=img2img_params)
         except Exception as hf_err:
+
             tb = traceback.format_exc()
             print("ERROR generating image:", hf_err)
             print(tb)
