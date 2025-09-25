@@ -720,15 +720,38 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
     raise RuntimeError("Hugging Face call failed for unknown reasons")
 
 # wrapper that chooses provider (HF preferred unless forced off)
-def generate_via_preferred_provider(prompt, language="en"):
+def generate_via_preferred_provider(prompt, language="en", source_image=None, img2img_params=None):
     """
     Returns (images_list, provider_name)
-    Tries Hugging Face first (if HF_API_TOKEN present and not forced off), otherwise uses Stable Horde.
-    Ensures returned image strings are absolute URLs the frontend can fetch.
-    This is a blocking call (it will poll Stable Horde if needed).
+    - If source_image is provided (base64 or data:), attempts img2img using Stable Horde.
+    - Otherwise behave like before (HF preferred, fallback to Stable Horde).
     """
     final_prompt = f"{prompt} (language: {language})"
-    # prefer HF unless forced off
+
+    # If user provided a source image -> use Stable Horde img2img (skip HF)
+    if source_image:
+        try:
+            imgs = call_stablehorde_img2img(final_prompt, source_image, params=img2img_params)
+            provider = "stablehorde-img2img"
+            # normalize and return
+            normalized = []
+            for it in (imgs or []):
+                try:
+                    u = ensure_absolute_url(it)
+                    normalized.append(u or it)
+                except Exception:
+                    normalized.append(it)
+            return normalized, provider
+        except Exception as e:
+            # attempt fallback to regular stablehorde generate (text->image)
+            print("[image] Stable Horde img2img failed:", e)
+            try:
+                imgs = call_stablehorde(final_prompt)
+                provider = "stablehorde-fallback"
+            except Exception as e2:
+                raise RuntimeError(f"Stable Horde img2img failed: {e}; fallback failed: {e2}")
+
+    # No source image: previous logic (HF preferred unless forced)
     if HF_API_TOKEN and not FORCE_STABLE_HORDE:
         try:
             imgs = call_hf_image(final_prompt)
@@ -747,7 +770,7 @@ def generate_via_preferred_provider(prompt, language="en"):
         except Exception as e:
             raise RuntimeError(f"Stable Horde failed: {e}")
 
-    # Normalize images into absolute URLs where possible (re-use your helper)
+    # Normalize images into absolute URLs where possible
     normalized = []
     for it in (imgs or []):
         try:
@@ -756,6 +779,7 @@ def generate_via_preferred_provider(prompt, language="en"):
         except Exception:
             normalized.append(it)
     return normalized, provider
+
 
 # ---------- LOG STARTUP ----------
 print(f"[startup] HF_MODEL = {HF_MODEL}")
