@@ -8,36 +8,52 @@ import time
 import re
 import base64
 import json
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, make_response
 from werkzeug.utils import secure_filename
 
 # File parsing
 import docx
 from PyPDF2 import PdfReader
 
-# ---------- CONFIG ----------
+# CORS helper
+from flask_cors import CORS
+
+# ---------- APP & CONFIG ----------
+app = Flask(__name__)
+
+# Upload folder config
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_DIR
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
-
-from flask_cors import CORS
 
 # Replace with the exact origin(s) your frontend uses
 FRONTEND_ORIGINS = [
     "https://bhaaratai.in",
-    "https://www.bhaaratai.in"
+    "https://www.bhaaratai.in",
+    "http://localhost:3000",
+    "http://localhost:8000"
 ]
 
-# Apply CORS to the whole app but restrict to allowed origins
-CORS(app,
-     origins=FRONTEND_ORIGINS,
-     supports_credentials=False,
+# Apply flask_cors with the allowed origins (still provide after_request fallback)
+CORS(app, origins=FRONTEND_ORIGINS, supports_credentials=False,
      allow_headers=["Content-Type", "Authorization", "apikey", "X-Requested-With"],
      methods=["GET", "POST", "OPTIONS"])
 
+# Fallback: ensure that every response includes CORS headers (helps when send_file/send_from_directory
+# or some error responses omit them). This will prefer the request's Origin if it matches allowed list.
+@app.after_request
+def _add_cors_headers(response):
+    origin = request.headers.get("Origin")
+    if origin and origin in FRONTEND_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    else:
+        # In development you can fallback to '*' but for production prefer to restrict.
+        response.headers["Access-Control-Allow-Origin"] = ",".join(FRONTEND_ORIGINS) if FRONTEND_ORIGINS else "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, apikey, X-Requested-With"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Credentials"] = "false"
+    return response
 
 # alias to use url_root inside helpers
 from flask import request as flask_request
@@ -51,13 +67,18 @@ def save_image_bytes_and_get_url(img_bytes, ext="png"):
     path = os.path.join(app.config["UPLOAD_FOLDER"], fname)
     with open(path, "wb") as f:
         f.write(img_bytes)
-    # Build an absolute URL so the frontend (on a different origin) fetches from backend correctly
     try:
         base = (flask_request.url_root or "").rstrip("/")
     except Exception:
         base = os.environ.get("BACKEND_URL", "").rstrip("/")
     if not base:
         base = os.environ.get("BACKEND_URL", "").rstrip("/")
+    # If base still empty, fall back to request.host_url (may be present)
+    if not base:
+        try:
+            base = request.host_url.rstrip("/")
+        except Exception:
+            base = ""
     return f"{base}/uploads/{fname}"
 
 def save_base64_and_return_url(b64_str):
@@ -67,7 +88,6 @@ def save_base64_and_return_url(b64_str):
     if not b64_str or not isinstance(b64_str, str):
         return None
     s = b64_str.strip()
-    # if data:...base64,... split
     if s.startswith("data:") and "," in s:
         s = s.split(",", 1)[1]
     s = s.replace("\n", "").replace("\r", "")
@@ -76,7 +96,6 @@ def save_base64_and_return_url(b64_str):
     except Exception as e:
         print("[save_base64] decode failed:", e)
         return None
-    # detect extension by signature
     ext = "png"
     if img_bytes.startswith(b"\x89PNG"):
         ext = "png"
@@ -89,11 +108,6 @@ def save_base64_and_return_url(b64_str):
 def ensure_absolute_url(s):
     """
     Normalize a returned image identifier into an absolute HTTP(S) URL that the frontend can fetch.
-    - if already http(s) -> return as-is
-    - if starts with '/uploads/' -> prefix with request.url_root or BACKEND_URL
-    - if data:... -> save and return uploaded file URL
-    - if looks like base64 -> save and return uploaded file URL
-    - otherwise return original string (may be handled by frontend)
     """
     if not s or not isinstance(s, str):
         return None
@@ -110,7 +124,6 @@ def ensure_absolute_url(s):
         return f"{base}{s}"
     if re.match(r"^https?://", s, flags=re.IGNORECASE):
         return s
-    # raw base64 heuristic
     candidate = s.replace("\n", "").replace("\r", "")
     if len(candidate) > 60 and re.fullmatch(r"[A-Za-z0-9+/=]+", candidate):
         return save_base64_and_return_url(candidate)
@@ -124,18 +137,15 @@ def normalize_image_entry(entry):
     try:
         if isinstance(entry, str):
             s = entry.strip()
-            # Try JSON parse if looks like JSON string
             if s.startswith("{") and s.endswith("}"):
                 try:
                     parsed = json.loads(s)
-                    # prefer commonly used fields
                     for key in ("b64_json", "img", "image", "data", "url"):
                         val = parsed.get(key)
                         if isinstance(val, str) and val.strip():
                             maybe = normalize_image_entry(val)
                             if maybe:
                                 return maybe
-                    # scan values for long base64-like strings
                     for v in parsed.values():
                         if isinstance(v, str) and len(v) > 60 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", v.replace("\n","").replace("\r","")):
                             return save_base64_and_return_url(v)
@@ -149,7 +159,6 @@ def normalize_image_entry(entry):
                     maybe = normalize_image_entry(entry[key].strip())
                     if maybe:
                         return maybe
-            # nested dict -> stringify and try
             try:
                 txt = json.dumps(entry)
                 return normalize_image_entry(txt)
@@ -162,10 +171,6 @@ def normalize_image_entry(entry):
     return None
 
 def _ensure_saved_urls_from_list(items):
-    """
-    Convert any data: or base64 entries in a provider response into saved file URLs.
-    Returns list of absolute URLs (or original entries if not convertible).
-    """
     out = []
     for it in (items or []):
         try:
@@ -173,24 +178,20 @@ def _ensure_saved_urls_from_list(items):
                 continue
             if isinstance(it, str):
                 s = it.strip()
-                # data URL
                 if s.startswith("data:"):
                     url = save_base64_and_return_url(s)
                     if url:
                         out.append(url)
                         continue
-                # raw base64 heuristic
                 cand = s.replace("\n","").replace("\r","")
                 if len(cand) > 60 and re.fullmatch(r"[A-Za-z0-9+/=]+", cand):
                     url = save_base64_and_return_url(cand)
                     if url:
                         out.append(url)
                         continue
-                # absolute http(s)
                 if re.match(r"^https?://", s, flags=re.IGNORECASE):
                     out.append(s)
                     continue
-                # relative uploads path
                 if s.startswith("/uploads/"):
                     try:
                         base = (flask_request.url_root or "").rstrip("/")
@@ -199,28 +200,18 @@ def _ensure_saved_urls_from_list(items):
                     if base:
                         out.append(base + s)
                         continue
-                # try normalize (covers JSON-encoded strings, etc.)
                 maybe = normalize_image_entry(s)
                 if maybe:
                     out.append(maybe)
                     continue
-                # fallback keep original
                 out.append(s)
             else:
-                # dict/list
                 maybe = normalize_image_entry(it)
                 out.append(maybe or it)
         except Exception as e:
             print("[_ensure_saved_urls_from_list] error:", e)
             out.append(it)
     return out
-
-# ---------- CORS ----------
-try:
-    from flask_cors import CORS
-    CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
-except Exception:
-    pass
 
 # ---------- PROVIDER CONFIG ----------
 TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "your_key_here")
@@ -238,11 +229,6 @@ STABLE_HORDE_POLL_INTERVAL = float(os.environ.get("STABLE_HORDE_POLL_INTERVAL", 
 
 # ---------- Stable Horde (fallback) ----------
 def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_TIMEOUT, poll_interval=STABLE_HORDE_POLL_INTERVAL):
-    """
-    Submit async generation to Stable Horde (aihorde.net) and poll until done.
-    Returns list of data URLs or http URLs.
-    This is a blocking call (it submits then polls until completion or timeout).
-    """
     if not prompt:
         raise RuntimeError("Empty prompt for Stable Horde")
 
@@ -277,7 +263,6 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
         raise RuntimeError("Stable Horde submit: failed to parse JSON response")
 
     job_id = job.get("id") or job.get("request_id") or job.get("job_id") or job.get("requestUUID")
-    # Sometimes API returns images immediately (rare) in "images" field
     if not job_id:
         if isinstance(job, dict) and job.get("images"):
             out = []
@@ -290,7 +275,6 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
                 return out
         raise RuntimeError(f"Stable Horde submit: no job id in response: {job}")
 
-    # Poll status endpoint used in earlier tests
     check_url = f"https://aihorde.net/api/v2/generate/status/{job_id}"
     deadline = time.time() + timeout
     last_err = None
@@ -307,17 +291,14 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
             time.sleep(poll_interval)
             continue
 
-        # Look for the common indicators that it's done
         if status.get("done") or status.get("finished") or status.get("status") == "done" or status.get("is_possible") is True and status.get("done"):
             images = []
-            # common shapes: 'generations' with dicts containing 'img' or 'img' as URL
             gens = status.get("generations") or status.get("images") or []
             if isinstance(gens, list):
                 for g in gens:
                     if isinstance(g, str) and g.startswith("http"):
                         images.append(g)
                     elif isinstance(g, dict):
-                        # { img: "url" } or { img: "base64..." }
                         img_field = g.get("img") or g.get("image") or g.get("url")
                         if isinstance(img_field, str):
                             if img_field.startswith("http"):
@@ -325,10 +306,8 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
                             elif img_field.startswith("data:"):
                                 images.append(img_field)
                             else:
-                                # sometimes it's raw base64
                                 if len(img_field) > 60 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", img_field.replace("\n","").replace("\r","")):
                                     images.append("data:image/png;base64," + img_field.replace("\n","").replace("\r",""))
-            # also some responses include "result" or "outputs"
             if isinstance(status, dict):
                 for key in ("result", "outputs"):
                     if key in status and isinstance(status[key], list):
@@ -340,7 +319,6 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
             images = [i for i in images if i]
             if images:
                 return images
-            # If finished but no images found, still raise
             if status.get("done") or status.get("finished"):
                 raise RuntimeError(f"Stable Horde finished but returned no images: {status}")
 
@@ -348,11 +326,8 @@ def call_stablehorde(prompt, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_
 
     raise RuntimeError(f"Stable Horde generation timed out after {timeout}s. Last error: {last_err}")
 
-# ---------- New: Async submit & status helpers for Stable Horde ----------
+# ---------- Stable Horde img2img ----------
 def stablehorde_submit_async(prompt, api_key=STABLE_HORDE_API_KEY):
-    """
-    Submit to aihorde async endpoint and return the job id (or raise).
-    """
     submit_url = "https://aihorde.net/api/v2/generate/async"
     headers = {"apikey": api_key, "Content-Type": "application/json"}
     payload = {
@@ -370,7 +345,6 @@ def stablehorde_submit_async(prompt, api_key=STABLE_HORDE_API_KEY):
     j = r.json()
     job_id = j.get("id") or j.get("request_id") or j.get("job_id") or j.get("requestUUID")
     if not job_id:
-        # sometimes immediate images are returned
         if isinstance(j, dict) and j.get("images"):
             imgs = []
             for it in j["images"]:
@@ -384,26 +358,17 @@ def stablehorde_submit_async(prompt, api_key=STABLE_HORDE_API_KEY):
     return {"job_id": job_id, "raw": j}
 
 def stablehorde_get_status(job_id, api_key=STABLE_HORDE_API_KEY):
-    """
-    Query aihorde status endpoint and return the parsed JSON.
-    """
     check_url = f"https://aihorde.net/api/v2/generate/status/{job_id}"
     headers = {"apikey": api_key}
     r = requests.get(check_url, headers=headers, timeout=30)
     if r.status_code != 200:
-        # return the raw body for debugging
         try:
             return {"error": r.text, "status_code": r.status_code}
         except Exception:
             return {"error": "unknown error", "status_code": r.status_code}
     return r.json()
+
 def call_stablehorde_img2img(prompt, source_image_b64, api_key=STABLE_HORDE_API_KEY, timeout=STABLE_HORDE_TIMEOUT, poll_interval=STABLE_HORDE_POLL_INTERVAL, params=None):
-    """
-    Submit an img2img (inpainting / img2img) async generation request to Stable Horde and poll until done.
-    - source_image_b64: data:image/*;base64,... OR raw base64 string
-    - params: dict with keys like steps, cfg_scale, denoising_strength, width, height, sampler, model, etc.
-    Returns list of data URLs or http URLs.
-    """
     if not prompt:
         raise RuntimeError("Empty prompt for Stable Horde img2img")
     if not source_image_b64:
@@ -412,16 +377,12 @@ def call_stablehorde_img2img(prompt, source_image_b64, api_key=STABLE_HORDE_API_
     submit_url = "https://stablehorde.net/api/v2/generate/async"
     headers = {"apikey": api_key, "Content-Type": "application/json"}
 
-    # normalize base64 - ensure it's just the base64 part or data:... form
     src = source_image_b64.strip()
-    # If it is a data URL keep it, else if it looks like raw base64 prefix it
     if not src.startswith("data:"):
-        # Try to be generous: if it has newlines, remove them
         cand = src.replace("\n", "").replace("\r", "")
-        if cand.startswith("iVBOR") or cand.startswith("/9j/"):  # png/jpg base64 starts
+        if cand.startswith("iVBOR") or cand.startswith("/9j/"):
             src = "data:image/png;base64," + cand
         else:
-            # otherwise try to use as-is
             src = cand
 
     payload = {
@@ -432,13 +393,10 @@ def call_stablehorde_img2img(prompt, source_image_b64, api_key=STABLE_HORDE_API_
             "width": 512,
             "height": 512
         },
-        # include the source image base64 as 'source_image' (Stable Horde accepts similar key in many clients)
         "source_image": src,
-        # indicate we want img2img mode if supported
         "type": "img2img"
     }
 
-    # merge user params if provided
     if params and isinstance(params, dict):
         payload_params = payload.get("params", {})
         payload_params.update({k: v for k, v in params.items() if k is not None})
@@ -463,7 +421,6 @@ def call_stablehorde_img2img(prompt, source_image_b64, api_key=STABLE_HORDE_API_
 
     job_id = job.get("id") or job.get("request_id") or job.get("job_id") or job.get("requestUUID")
     if not job_id:
-        # fallback: maybe immediate images returned in response
         out = []
         if isinstance(job, dict):
             if job.get("images"):
@@ -521,23 +478,12 @@ def call_stablehorde_img2img(prompt, source_image_b64, api_key=STABLE_HORDE_API_
 
     raise RuntimeError(f"Stable Horde img2img timed out after {timeout}s. Last error: {last_err}")
 
-
-
-
-
-# ---------- Hugging Face image helper (IMPROVED & LOGGING) ----------
+# ---------- Hugging Face helper ----------
 def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=REQUEST_TIMEOUT):
-    """
-    Calls Hugging Face Inference API for image generation.
-    - If the model returns image bytes directly (Content-Type image/*) we save them and return a URL.
-    - If the model returns JSON containing base64 or urls, we extract those and save/normalize.
-    Returns: list of absolute image URLs (or remote urls) or raises RuntimeError.
-    """
     if not HF_API_TOKEN:
         raise RuntimeError("HF_API_TOKEN not set in environment")
 
     hf_url = f"https://api-inference.huggingface.co/models/{model}"
-    # NOTE: we do not force Accept to image/png only, because some models return JSON.
     headers = {
         "Authorization": f"Bearer {HF_API_TOKEN}",
         "Accept": "application/json, image/png, image/jpeg, image/webp",
@@ -557,7 +503,6 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
         return len(s2) > 50 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r" for c in s2)
 
     def _save_bytes_and_url(img_bytes, content_type):
-        # determine extension
         ext = "png"
         try:
             if "/" in content_type:
@@ -567,11 +512,8 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
         return save_image_bytes_and_get_url(img_bytes, ext=ext)
 
     def _try_extract_and_save_from_json(j):
-        # j may be dict, list, etc.
         candidates = []
-
         if isinstance(j, dict):
-            # common fields
             for k in ("b64_json", "img", "image", "url", "data"):
                 v = j.get(k)
                 if isinstance(v, str):
@@ -581,12 +523,10 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
                         if isinstance(it, str):
                             candidates.append(it)
                         elif isinstance(it, dict):
-                            # nested
                             if it.get("b64_json"):
                                 candidates.append(it.get("b64_json"))
                             if it.get("url"):
                                 candidates.append(it.get("url"))
-            # possibly j["data"] is [{b64_json:...}, ...]
             if j.get("data") and isinstance(j["data"], list):
                 for d in j["data"]:
                     if isinstance(d, dict):
@@ -603,7 +543,6 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
                         if it.get(k):
                             candidates.append(it.get(k))
 
-        # normalize & save
         urls = []
         for s in candidates:
             if not s or not isinstance(s, str):
@@ -627,7 +566,6 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
                     continue
                 except Exception:
                     pass
-        # dedupe preserve order
         return list(dict.fromkeys(urls))
 
     for attempt in range(attempts):
@@ -639,29 +577,23 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
             print(f"[HF] status={status} content-type={ctype}")
 
             if status == 200:
-                # direct image bytes (some models return image bytes)
                 if ctype.startswith("image/"):
                     img_bytes = resp.content
                     return [_save_bytes_and_url(img_bytes, ctype)]
 
-                # else try parse JSON
                 try:
                     j = resp.json()
                 except Exception:
                     txt = resp.text or ""
-                    # maybe raw base64 in text
                     if _is_base64_string(txt):
                         img_bytes = base64.b64decode(txt)
                         return [_save_bytes_and_url(img_bytes, "image/png")]
-                    # fallback: return textual body as a single item
                     return [txt]
 
-                # attempt to extract images from JSON
                 urls = _try_extract_and_save_from_json(j)
                 if urls:
                     return urls
 
-                # find http urls nested anywhere in the JSON
                 def find_http_urls(obj):
                     found = []
                     if isinstance(obj, str) and (obj.startswith("http://") or obj.startswith("https://")):
@@ -676,19 +608,14 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
 
                 found = find_http_urls(j)
                 if found:
-                    # dedupe
                     return list(dict.fromkeys(found))
-
-                # nothing extractable - return JSON string (caller will inspect)
                 return [json.dumps(j)]
 
-            # transient statuses - retry with backoff
             elif status in (202, 429, 503):
                 try:
                     body = resp.json()
                 except Exception:
                     body = resp.text
-                print(f"[HF] transient status {status}: {str(body)[:300]}")
                 wait = backoff[min(attempt, len(backoff) - 1)]
                 last_exception = RuntimeError(f"HF transient status {status}: {body}")
                 time.sleep(wait)
@@ -714,26 +641,17 @@ def call_hf_image(prompt, model=HF_MODEL, max_retries=HF_MAX_RETRIES, timeout=RE
             last_exception = exc
             break
 
-    # after attempts
     if last_exception:
         raise RuntimeError(f"Hugging Face call failed after {attempts} attempts: {last_exception}")
     raise RuntimeError("Hugging Face call failed for unknown reasons")
 
-# wrapper that chooses provider (HF preferred unless forced off)
 def generate_via_preferred_provider(prompt, language="en", source_image=None, img2img_params=None):
-    """
-    Returns (images_list, provider_name)
-    - If source_image is provided (base64 or data:), attempts img2img using Stable Horde.
-    - Otherwise behave like before (HF preferred, fallback to Stable Horde).
-    """
     final_prompt = f"{prompt} (language: {language})"
 
-    # If user provided a source image -> use Stable Horde img2img (skip HF)
     if source_image:
         try:
             imgs = call_stablehorde_img2img(final_prompt, source_image, params=img2img_params)
             provider = "stablehorde-img2img"
-            # normalize and return
             normalized = []
             for it in (imgs or []):
                 try:
@@ -743,7 +661,6 @@ def generate_via_preferred_provider(prompt, language="en", source_image=None, im
                     normalized.append(it)
             return normalized, provider
         except Exception as e:
-            # attempt fallback to regular stablehorde generate (text->image)
             print("[image] Stable Horde img2img failed:", e)
             try:
                 imgs = call_stablehorde(final_prompt)
@@ -751,7 +668,6 @@ def generate_via_preferred_provider(prompt, language="en", source_image=None, im
             except Exception as e2:
                 raise RuntimeError(f"Stable Horde img2img failed: {e}; fallback failed: {e2}")
 
-    # No source image: previous logic (HF preferred unless forced)
     if HF_API_TOKEN and not FORCE_STABLE_HORDE:
         try:
             imgs = call_hf_image(final_prompt)
@@ -770,7 +686,6 @@ def generate_via_preferred_provider(prompt, language="en", source_image=None, im
         except Exception as e:
             raise RuntimeError(f"Stable Horde failed: {e}")
 
-    # Normalize images into absolute URLs where possible
     normalized = []
     for it in (imgs or []):
         try:
@@ -780,7 +695,6 @@ def generate_via_preferred_provider(prompt, language="en", source_image=None, im
             normalized.append(it)
     return normalized, provider
 
-
 # ---------- LOG STARTUP ----------
 print(f"[startup] HF_MODEL = {HF_MODEL}")
 print(f"[startup] HF_API_TOKEN present: {bool(HF_API_TOKEN)}; FORCE_STABLE_HORDE={FORCE_STABLE_HORDE}; STABLE_HORDE_KEY_present={STABLE_HORDE_API_KEY != '0000000000'}")
@@ -789,7 +703,7 @@ print(f"[startup] HF_API_TOKEN present: {bool(HF_API_TOKEN)}; FORCE_STABLE_HORDE
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 TAVILY_URL = os.environ.get("TAVILY_URL", "https://api.tavily.com/search")
 
-# ---------- AGENT CONFIG (unchanged) ----------
+# ---------- AGENT CONFIG ----------
 AGENTS = {
     "general": {
         "system": (
@@ -838,7 +752,7 @@ AGENTS = {
 }
 DEFAULT_AGENT_KEY = "general"
 
-# ---------- Helpers for files, parsing, chat endpoints (kept concise) ----------
+# ---------- Helpers for files, parsing, chat endpoints ----------
 def extract_text_from_file(path, mimetype):
     try:
         if mimetype == "text/plain":
@@ -978,6 +892,7 @@ def health():
 
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
+    # send_from_directory will return file bytes -- after_request will add CORS headers
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=False)
 
 @app.errorhandler(413)
@@ -1018,7 +933,6 @@ def chat():
 
         images = []
         provider_used = None
-        # 1) detect explicit user intent `/image prompt`
         m_user_img = re.match(r"^/image\s+(.+)$", (message or "").strip(), flags=re.IGNORECASE)
         if m_user_img:
             img_prompt = m_user_img.group(1).strip()
@@ -1027,7 +941,6 @@ def chat():
             except Exception as e_img:
                 reply += f"\n\n[Image generation failed: {str(e_img)}]"
 
-        # 2) detect model instruction in the reply like: [generate_image: prompt]
         if not images:
             m = re.search(r"\[generate_image\s*:\s*(.+?)\]", reply, flags=re.IGNORECASE)
             if m:
@@ -1037,7 +950,6 @@ def chat():
                 except Exception as e_img:
                     reply += f"\n\n[Image generation failed: {str(e_img)}]"
 
-        # Append clickable links for web results
         if agent_key == "web" and web_results:
             src_lines = []
             for i, r in enumerate(web_results, start=1):
@@ -1048,7 +960,6 @@ def chat():
             if src_lines:
                 reply += "<br><br>" + "<br>".join(src_lines)
 
-        # File chips
         links_html = ""
         if saved_files:
             chips = " ".join(
@@ -1073,12 +984,6 @@ def chat():
 
 @app.route("/generate-image", methods=["POST"])
 def generate_image():
-    """
-    Called by frontend image button.
-    Expects JSON: { prompt: "...", language: "en" }
-    Returns: { images: [absolute_url1, ...], provider: "huggingface"|"stablehorde" }
-    This endpoint is synchronous: it will block until provider returns images (HF immediate or Stable Horde polled).
-    """
     try:
         try:
             body = request.get_json(silent=True)
@@ -1093,14 +998,12 @@ def generate_image():
         if not prompt:
             return jsonify({"error": "missing_prompt"}), 400
 
-               # read optional source_image or params from request
         source_image = body.get("source_image") or body.get("image") or body.get("img")
         img2img_params = body.get("params") or body.get("img2img_params") or None
 
         try:
             images, provider = generate_via_preferred_provider(prompt, language=language, source_image=source_image, img2img_params=img2img_params)
         except Exception as hf_err:
-
             tb = traceback.format_exc()
             print("ERROR generating image:", hf_err)
             print(tb)
@@ -1110,7 +1013,6 @@ def generate_image():
                 "traceback": tb
             }), 500
 
-        # If anything looks like a relative / data / base64, ensure absolute fetchable URLs
         normalized = []
         for it in (images or []):
             url = None
@@ -1121,7 +1023,6 @@ def generate_image():
             if url:
                 normalized.append(url)
             else:
-                # fallback try ensure_absolute_url for strings
                 if isinstance(it, str):
                     fallback = ensure_absolute_url(it)
                     normalized.append(fallback or it)
@@ -1136,14 +1037,8 @@ def generate_image():
         print(tb)
         return jsonify({"error": "invalid_request", "details": str(e), "traceback": tb}), 500
 
-# ---------------- New async endpoints for Stable Horde ----------------
 @app.route("/generate-image-async", methods=["POST"])
 def generate_image_async():
-    """
-    Submit an image generation job to Stable Horde and return job_id immediately.
-    JSON body: { prompt: "..." }
-    Returns: { job_id: "...", provider: "stablehorde" } or { images: [...] } if images returned immediately.
-    """
     try:
         data = request.get_json(silent=True) or {}
         prompt = (data.get("prompt") or data.get("text") or "").strip()
@@ -1158,7 +1053,6 @@ def generate_image_async():
             print(tb)
             return jsonify({"error": "stablehorde_submit_failed", "details": str(e)}), 500
 
-        # If submission returned images immediately (rare), return them
         if res.get("images"):
             imgs = _ensure_saved_urls_from_list(res["images"])
             return jsonify({"images": imgs, "provider": "stablehorde"})
@@ -1176,19 +1070,13 @@ def generate_image_async():
 
 @app.route("/image-status/<job_id>", methods=["GET"])
 def image_status(job_id):
-    """
-    Poll Stable Horde status for job_id and return a normalized response.
-    Returns { status: "processing"|"done"|"failed", img_url: "...", generations: [...] }
-    """
     try:
         info = stablehorde_get_status(job_id)
-        # If error dictionary returned
         if info is None:
             return jsonify({"status": "processing"}), 202
         if isinstance(info, dict) and info.get("error"):
             return jsonify({"status": "error", "details": info.get("error"), "status_code": info.get("status_code")}), 500
 
-        # look for finished
         done = False
         if info.get("done") or info.get("finished") or info.get("status") == "done" or info.get("is_possible") is True and info.get("done"):
             done = True
@@ -1207,19 +1095,15 @@ def image_status(job_id):
                         elif img_field.startswith("data:"):
                             images.append(img_field)
                         else:
-                            # base64 heuristics
                             cand = img_field.replace("\n","").replace("\r","")
                             if len(cand) > 60 and re.fullmatch(r"[A-Za-z0-9+/=]+", cand):
                                 images.append("data:image/png;base64," + cand)
-        # If done and images found - normalize and return first one + generations
         if done and images:
             saved = _ensure_saved_urls_from_list(images)
             return jsonify({"status": "done", "img_url": saved[0] if saved else images[0], "generations": images})
-        # If done but no images present, still return raw info
         if done:
             return jsonify({"status": "done", "generations": generations, "raw": info})
 
-        # still processing
         return jsonify({"status": "processing", "queue_position": info.get("queue_position"), "wait_time": info.get("wait_time")}), 202
 
     except Exception as e:
@@ -1231,5 +1115,4 @@ def image_status(job_id):
 # ------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Keep debug True locally, Render will run via gunicorn
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
