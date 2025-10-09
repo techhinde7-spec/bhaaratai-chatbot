@@ -23,6 +23,15 @@ from flask_cors import CORS
 # ---------- APP & CONFIG ----------
 app = Flask(__name__)
 
+@app.route("/")
+def home():
+    return jsonify({"status": "Bhaaratai Backend Running ✅"})
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "time": datetime.datetime.utcnow().isoformat()})
+
+
 # Upload folder config
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
