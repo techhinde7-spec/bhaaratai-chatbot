@@ -57,11 +57,12 @@ def _add_cors_headers(response):
     if origin and origin in FRONTEND_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
     else:
-        response.headers["Access-Control-Allow-Origin"] = ",".join(FRONTEND_ORIGINS) if FRONTEND_ORIGINS else "*"
+        response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, apikey, X-Requested-With"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Credentials"] = "false"
     return response
+
 
 # alias to use url_root inside helpers
 from flask import request as flask_request
