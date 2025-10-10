@@ -154,12 +154,17 @@ TOGETHER_URL = os.environ.get("TOGETHER_URL", "https://api.together.xyz/v1/chat/
 
 # ---------- HUGGING FACE HELPERS ----------
 def call_hf_image(prompt: str):
-    """Call Hugging Face image generation API and return list of URLs or raise."""
+    """Call Hugging Face image generation API and return list of saved URLs."""
     if not HF_API_TOKEN:
         raise RuntimeError("HF_API_TOKEN not set")
 
     hf_url = f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL}"
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}", "Accept": "application/json, image/png, image/jpeg, image/webp"}
+    # Request JSON and let the server decide to return JSON or binary
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Accept": "application/json",      # <- IMPORTANT: use only application/json here
+        "User-Agent": "BharatAI/Render"
+    }
     payload = {"inputs": prompt, "options": {"wait_for_model": True}}
 
     backoff = [1, 2, 4, 8]
@@ -171,49 +176,56 @@ def call_hf_image(prompt: str):
             resp = requests.post(hf_url, json=payload, headers=headers, timeout=HF_TIMEOUT)
             status = resp.status_code
             ctype = (resp.headers.get("Content-Type") or "").lower()
+
             if status == 200:
-                # binary image returned
+                # If they responded with an image binary (some setups do), save it
                 if ctype.startswith("image/"):
-                    url = save_bytes_and_get_url(resp.content, content_type=ctype, ext_hint=(ctype.split("/")[1] if "/" in ctype else "png"))
+                    url = save_bytes_and_get_url(resp.content, content_type=ctype,
+                                                 ext_hint=(ctype.split("/")[1] if "/" in ctype else "png"))
                     return [url]
-                # try parse json body for base64 or urls
+
+                # Otherwise try parse JSON body to find base64 or http image links inside
                 try:
                     j = resp.json()
                 except Exception:
+                    # maybe raw base64 text
                     txt = resp.text or ""
-                    # if raw base64
                     cleaned = txt.replace("\n", "").replace("\r", "")
                     if len(cleaned) > 100 and re.fullmatch(r"[A-Za-z0-9+/=]+", cleaned):
                         url = save_base64_and_return_url(cleaned)
                         if url:
                             return [url]
+                    # return raw text as fallback
                     return [txt]
-                # search for image data inside JSON
-                found = []
+
+                # extract image fields from JSON if present
+                images = []
                 def collect(obj):
                     if isinstance(obj, str):
                         s = obj.strip()
                         if s.startswith("http://") or s.startswith("https://"):
-                            found.append(s)
+                            images.append(s)
                         elif s.startswith("data:"):
                             u = save_base64_and_return_url(s)
-                            if u: found.append(u)
+                            if u: images.append(u)
                         else:
                             c = s.replace("\n", "").replace("\r", "")
                             if len(c) > 100 and re.fullmatch(r"[A-Za-z0-9+/=]+", c):
                                 u = save_base64_and_return_url(c)
-                                if u: found.append(u)
+                                if u: images.append(u)
                     elif isinstance(obj, dict):
-                        for v in obj.values():
-                            collect(v)
+                        for v in obj.values(): collect(v)
                     elif isinstance(obj, list):
-                        for it in obj:
-                            collect(it)
+                        for it in obj: collect(it)
+
                 collect(j)
-                found = list(dict.fromkeys(found))
-                if found:
-                    return found
+                images = list(dict.fromkeys(images))
+                if images:
+                    return images
+
+                # No images found in JSON => return JSON as string (debug)
                 return [json.dumps(j)]
+
             elif status in (202, 429, 503):
                 last_exc = RuntimeError(f"HF transient status {status}: {resp.text[:200]}")
                 time.sleep(backoff[min(attempt, len(backoff)-1)])
@@ -224,6 +236,7 @@ def call_hf_image(prompt: str):
                 except Exception:
                     err = resp.text
                 raise RuntimeError(f"Hugging Face image error {status}: {err}")
+
         except requests.RequestException as e:
             last_exc = e
             time.sleep(backoff[min(attempt, len(backoff)-1)])
@@ -233,12 +246,16 @@ def call_hf_image(prompt: str):
 
 
 def call_hf_video(prompt: str):
-    """Call Hugging Face text-to-video model and return list of URLs or raise."""
+    """Call Hugging Face text-to-video model and return list of saved URLs."""
     if not HF_API_TOKEN:
         raise RuntimeError("HF_API_TOKEN not set")
 
     hf_url = f"https://api-inference.huggingface.co/models/{HF_VIDEO_MODEL}"
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}", "Accept": "application/json, video/mp4, video/webm, application/octet-stream"}
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Accept": "application/json",   # <- IMPORTANT: ask for JSON and then handle binary if returned
+        "User-Agent": "BharatAI/Render"
+    }
     payload = {"inputs": prompt, "options": {"wait_for_model": True}}
 
     backoff = [1, 2, 4, 8]
@@ -250,11 +267,13 @@ def call_hf_video(prompt: str):
             resp = requests.post(hf_url, json=payload, headers=headers, timeout=HF_TIMEOUT)
             status = resp.status_code
             ctype = (resp.headers.get("Content-Type") or "").lower()
+
             if status == 200:
                 if ctype.startswith("video/") or "octet-stream" in ctype:
-                    url = save_bytes_and_get_url(resp.content, content_type=ctype, ext_hint=(ctype.split("/")[1] if "/" in ctype else "mp4"))
+                    url = save_bytes_and_get_url(resp.content, content_type=ctype,
+                                                 ext_hint=(ctype.split("/")[1] if "/" in ctype else "mp4"))
                     return [url]
-                # try json
+
                 try:
                     j = resp.json()
                 except Exception:
@@ -264,7 +283,7 @@ def call_hf_video(prompt: str):
                         u = save_base64_and_return_url(cleaned)
                         if u: return [u]
                     return [txt]
-                # collect video fields if present
+
                 found = []
                 def collect(obj):
                     if isinstance(obj, str):
@@ -280,16 +299,17 @@ def call_hf_video(prompt: str):
                                 u = save_base64_and_return_url(c)
                                 if u: found.append(u)
                     elif isinstance(obj, dict):
-                        for v in obj.values():
-                            collect(v)
+                        for v in obj.values(): collect(v)
                     elif isinstance(obj, list):
-                        for it in obj:
-                            collect(it)
+                        for it in obj: collect(it)
+
                 collect(j)
                 found = list(dict.fromkeys(found))
                 if found:
                     return found
+
                 return [json.dumps(j)]
+
             elif status in (202, 429, 503):
                 last_exc = RuntimeError(f"HF transient status {status}: {resp.text[:200]}")
                 time.sleep(backoff[min(attempt, len(backoff)-1)])
@@ -300,12 +320,14 @@ def call_hf_video(prompt: str):
                 except Exception:
                     err = resp.text
                 raise RuntimeError(f"Hugging Face video error {status}: {err}")
+
         except requests.RequestException as e:
             last_exc = e
             time.sleep(backoff[min(attempt, len(backoff)-1)])
             continue
 
     raise RuntimeError(f"Hugging Face video call failed after {attempts} attempts: {last_exc}")
+
 
 
 # ---------- Chat helper (Together optional, HF fallback) ----------
