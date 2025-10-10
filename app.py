@@ -187,8 +187,49 @@ def chat():
         if not message:
             return jsonify({"error": "missing_message"}), 400
 
-        reply = f"You said: {message}. (Bhaaratai backend is connected and replying successfully!)"
+   import requests
+
+TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY")
+TOGETHER_URL = "https://api.together.xyz/v1/chat/completions"
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    try:
+        if request.content_type and "application/json" in request.content_type:
+            data = request.get_json(silent=True) or {}
+            message = data.get("message", "").strip()
+        else:
+            message = request.form.get("message", "").strip()
+
+        if not message:
+            return jsonify({"error": "missing_message"}), 400
+
+        if not TOGETHER_API_KEY:
+            return jsonify({"error": "missing_together_api_key"}), 500
+
+        # Call Together AI model
+        payload = {
+            "model": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+            "messages": [{"role": "user", "content": message}],
+            "temperature": 0.7,
+        }
+        headers = {
+            "Authorization": f"Bearer {TOGETHER_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        res = requests.post(TOGETHER_URL, headers=headers, json=payload, timeout=60)
+        res.raise_for_status()
+        data = res.json()
+        reply = data["choices"][0]["message"]["content"]
+
         return jsonify({"response": reply, "timestamp": datetime.datetime.utcnow().isoformat()})
+
+    except Exception as e:
+        print("Chat route error:", e)
+        traceback.print_exc()
+        return jsonify({"error": "internal_error", "details": str(e)}), 500
+
     except Exception as e:
         print("Chat route error:", e)
         return jsonify({"error": "internal_error", "details": str(e)}), 500
