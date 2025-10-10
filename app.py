@@ -701,5 +701,40 @@ def generate_video():
 
 # ------------------------------------------------------------------------
 
+@app.route("/chat", methods=["POST"])
+def chat():
+    try:
+        # Accept both multipart form and JSON
+        if request.content_type and "application/json" in request.content_type:
+            data = request.get_json(silent=True) or {}
+            message = data.get("message", "").strip()
+        else:
+            message = request.form.get("message", "").strip()
+
+        if not message:
+            return jsonify({"error": "missing_message"}), 400
+
+        # Example simple reply (replace with your Together API logic if needed)
+        reply = f"You said: {message}. (Bhaaratai backend is connected and replying successfully!)"
+        return jsonify({"response": reply, "timestamp": datetime.datetime.utcnow().isoformat()})
+
+    except Exception as e:
+        print("Chat route error:", e)
+        return jsonify({"error": "internal_error", "details": str(e)}), 500
+@app.route("/generate-image", methods=["POST"])
+def generate_image():
+    body = request.get_json(silent=True)
+    prompt = (body or {}).get("prompt", "")
+    if not prompt:
+        return jsonify({"error": "missing_prompt"}), 400
+
+    # Minimal test call to verify HF integration
+    try:
+        images = call_hf_image(prompt)
+        return jsonify({"images": images, "provider": "huggingface"})
+    except Exception as e:
+        return jsonify({"error": "generation_failed", "details": str(e)}), 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
