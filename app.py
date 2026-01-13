@@ -127,10 +127,16 @@ def build_image_prompt(prompt, style=None, size=None):
 def hf_post_with_backoff(url, headers, payload):
     for attempt in range(HF_RETRIES):
         try:
-            return requests.post(url, headers=headers, json=payload, timeout=HF_TIMEOUT)
+            return requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=HF_TIMEOUT
+            )
         except Exception:
             time.sleep(2 ** attempt)
     raise RuntimeError("HF request failed after retries")
+
 
 def call_hf_image(prompt, model):
     if not HF_API_TOKEN:
@@ -199,16 +205,22 @@ def call_hf_image(prompt, model):
                 if url:
                     return [url]
 
-raise RuntimeError(f"No image found in HF response: {str(data)[:300]}")
+    # ✅ FINAL fallback (INSIDE FUNCTION!)
+    raise RuntimeError(f"No image found in HF response: {str(data)[:300]}")
+
 
 def call_hf_video(prompt, model):
     url = f"https://router.huggingface.co/hf-inference/models/{model}"
     headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
     payload = {"inputs": prompt, "options": {"wait_for_model": True}}
+
     resp = hf_post_with_backoff(url, headers, payload)
+
     if resp.status_code == 200:
         return [save_bytes_and_get_url(resp.content, "mp4")]
+
     raise RuntimeError(resp.text)
+
 
 # ---------- ROUTES ----------
 @app.route("/")
