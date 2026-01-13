@@ -154,21 +154,20 @@ def call_hf_image(prompt, model):
 
     content_type = (resp.headers.get("Content-Type") or "").lower()
 
-    # ✅ CASE 1: Raw image bytes
-if content_type.startswith("image/"):
-    return [
-        save_bytes_and_get_url(
-            resp.content,
-            content_type,
-            "png"
-        )
-    ]
+    # ✅ CASE 1: raw image bytes
+    if content_type.startswith("image/"):
+        return [
+            save_bytes_and_get_url(
+                resp.content,
+                content_type,
+                "png"
+            )
+        ]
 
     # Try JSON
     try:
         data = resp.json()
     except Exception:
-        # ✅ CASE 2: Plain text / base64
         txt = resp.text.strip()
         if len(txt) > 100:
             url = save_base64_and_return_url(txt)
@@ -176,14 +175,14 @@ if content_type.startswith("image/"):
                 return [url]
         raise RuntimeError("HF returned non-image, non-JSON response")
 
-    # ✅ CASE 3: JSON is STRING (your crash case)
+    # ✅ CASE 2: JSON is string
     if isinstance(data, str):
         url = save_base64_and_return_url(data)
         if url:
             return [url]
         raise RuntimeError("HF returned string but not base64 image")
 
-    # ✅ CASE 4: JSON list
+    # ✅ CASE 3: JSON list
     if isinstance(data, list):
         for item in data:
             if isinstance(item, str):
@@ -191,7 +190,7 @@ if content_type.startswith("image/"):
                 if url:
                     return [url]
 
-    # ✅ CASE 5: JSON dict with base64 fields
+    # ✅ CASE 4: JSON dict with base64 fields
     if isinstance(data, dict):
         for key in ("image", "b64", "b64_json", "data"):
             val = data.get(key)
@@ -200,8 +199,7 @@ if content_type.startswith("image/"):
                 if url:
                     return [url]
 
-    raise RuntimeError(f"No image found in HF response: {str(data)[:300]}")
-
+raise RuntimeError(f"No image found in HF response: {str(data)[:300]}")
 
 def call_hf_video(prompt, model):
     url = f"https://router.huggingface.co/hf-inference/models/{model}"
