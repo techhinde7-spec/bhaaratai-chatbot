@@ -139,7 +139,7 @@ def call_hf_image(prompt, model):
     url = f"https://router.huggingface.co/hf-inference/models/{model}"
     headers = {
         "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Accept": "application/json"
+        "Accept": "*/*"
     }
 
     payload = {
@@ -152,15 +152,55 @@ def call_hf_image(prompt, model):
     if resp.status_code != 200:
         raise RuntimeError(resp.text)
 
-    # 🔥 SD-3 returns JSON
-    data = resp.json()
+    content_type = (resp.headers.get("Content-Type") or "").lower()
 
-    # Try common SD-3 formats
-    for key in ("image", "b64", "b64_json", "data"):
-        if key in data:
-            return [save_base64_and_return_url(data[key])]
+    # ✅ CASE 1: Raw image bytes
+    if content_type.startswith("image/"):
+        return [
+            save_bytes_and_get_url(
+                resp.content,
+                content_type=content_type,
+                ext_hint="png"
+            )
+        ]
 
-    raise RuntimeError("No image found in HF response")
+    # Try JSON
+    try:
+        data = resp.json()
+    except Exception:
+        # ✅ CASE 2: Plain text / base64
+        txt = resp.text.strip()
+        if len(txt) > 100:
+            url = save_base64_and_return_url(txt)
+            if url:
+                return [url]
+        raise RuntimeError("HF returned non-image, non-JSON response")
+
+    # ✅ CASE 3: JSON is STRING (your crash case)
+    if isinstance(data, str):
+        url = save_base64_and_return_url(data)
+        if url:
+            return [url]
+        raise RuntimeError("HF returned string but not base64 image")
+
+    # ✅ CASE 4: JSON list
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                url = save_base64_and_return_url(item)
+                if url:
+                    return [url]
+
+    # ✅ CASE 5: JSON dict with base64 fields
+    if isinstance(data, dict):
+        for key in ("image", "b64", "b64_json", "data"):
+            val = data.get(key)
+            if isinstance(val, str):
+                url = save_base64_and_return_url(val)
+                if url:
+                    return [url]
+
+    raise RuntimeError(f"No image found in HF response: {str(data)[:300]}")
 
 
 def call_hf_video(prompt, model):
