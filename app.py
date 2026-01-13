@@ -83,8 +83,8 @@ with app.app_context():
     db.commit()
 
 # ---------- FILE HELPERS ----------
-def save_bytes_and_get_url(b: bytes, ext="png"):
-    fname = f"{uuid.uuid4().hex}.{ext}"
+ def save_bytes_and_get_url(content, content_type, extension="png"):  
+fname = f"{uuid.uuid4().hex}.{ext}"
     path = os.path.join(UPLOAD_DIR, fname)
     with open(path, "wb") as f:
         f.write(b)
@@ -160,13 +160,12 @@ def call_hf_image(prompt, model):
 
     content_type = (resp.headers.get("Content-Type") or "").lower()
 
-    # ✅ CASE 1: raw image bytes
+# ✅ CASE 1: raw image bytes
     if content_type.startswith("image/"):
         return [
             save_bytes_and_get_url(
                 resp.content,
-                content_type,
-                "png"
+                content_type
             )
         ]
 
