@@ -139,15 +139,29 @@ def call_hf_image(prompt, model):
     url = f"https://router.huggingface.co/hf-inference/models/{model}"
     headers = {
         "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Accept": "*/*"
+        "Accept": "application/json"
     }
-    payload = {"inputs": prompt, "options": {"wait_for_model": True}}
 
-    resp = hf_post_with_backoff(url, headers, payload)
+    payload = {
+        "inputs": prompt,
+        "options": {"wait_for_model": True}
+    }
 
-    if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
-        return [save_bytes_and_get_url(resp.content)]
-    raise RuntimeError(resp.text)
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+
+    if resp.status_code != 200:
+        raise RuntimeError(resp.text)
+
+    # 🔥 SD-3 returns JSON
+    data = resp.json()
+
+    # Try common SD-3 formats
+    for key in ("image", "b64", "b64_json", "data"):
+        if key in data:
+            return [save_base64_and_return_url(data[key])]
+
+    raise RuntimeError("No image found in HF response")
+
 
 def call_hf_video(prompt, model):
     url = f"https://router.huggingface.co/hf-inference/models/{model}"
