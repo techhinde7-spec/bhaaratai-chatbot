@@ -155,14 +155,14 @@ def call_hf_image(prompt, model):
     content_type = (resp.headers.get("Content-Type") or "").lower()
 
     # ✅ CASE 1: Raw image bytes
-    if content_type.startswith("image/"):
-        return [
-            save_bytes_and_get_url(
-                resp.content,
-                content_type=content_type,
-                ext_hint="png"
-            )
-        ]
+if content_type.startswith("image/"):
+    return [
+        save_bytes_and_get_url(
+            resp.content,
+            content_type,
+            "png"
+        )
+    ]
 
     # Try JSON
     try:
