@@ -16,6 +16,8 @@ from flask_cors import CORS
 app = Flask(__name__)
 
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_DIR
 app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024
@@ -83,12 +85,20 @@ with app.app_context():
     db.commit()
 # ---------- FILE HELPERS ----------
 def save_bytes_and_get_url(content, extension="png"):
-    # Everything below is indented by 4 spaces
-    fname = f"{uuid.uuid4().hex}.{extension}"
+    # If extension comes in as "image/jpeg", change it to "jpg"
+    if "/" in extension:
+        extension = extension.split("/")[-1]
+    
+    # Ensure there's a dot before the extension
+    if not extension.startswith("."):
+        extension = f".{extension}"
+        
+    fname = f"{uuid.uuid4().hex}{extension}"
     path = os.path.join(UPLOAD_DIR, fname)
+    
     with open(path, "wb") as f:
-        # This is indented by 8 spaces (inside the 'with' block)
         f.write(content)
+        
     return f"{request.host_url.rstrip('/')}/uploads/{fname}"
 
 def save_base64_and_return_url(b64):
