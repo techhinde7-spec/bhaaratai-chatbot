@@ -81,14 +81,14 @@ with app.app_context():
     )
     """)
     db.commit()
-
 # ---------- FILE HELPERS ----------
-@app.route('/generate-image', methods=['POST'])
-def generate_image():
-fname = f"{uuid.uuid4().hex}.{ext}"
+def save_bytes_and_get_url(content, extension="png"):
+    # Everything below is indented by 4 spaces
+    fname = f"{uuid.uuid4().hex}.{extension}"
     path = os.path.join(UPLOAD_DIR, fname)
     with open(path, "wb") as f:
-        f.write(b)
+        # This is indented by 8 spaces (inside the 'with' block)
+        f.write(content)
     return f"{request.host_url.rstrip('/')}/uploads/{fname}"
 
 def save_base64_and_return_url(b64):
@@ -97,7 +97,6 @@ def save_base64_and_return_url(b64):
         return save_bytes_and_get_url(b)
     except Exception:
         return None
-
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
     return send_from_directory(UPLOAD_DIR, filename)
