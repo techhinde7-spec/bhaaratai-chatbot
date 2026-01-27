@@ -83,7 +83,8 @@ with app.app_context():
     db.commit()
 
 # ---------- FILE HELPERS ----------
- def save_bytes_and_get_url(content, content_type, extension="png"):  
+@app.route('/generate-image', methods=['POST'])
+def generate_image():
 fname = f"{uuid.uuid4().hex}.{ext}"
     path = os.path.join(UPLOAD_DIR, fname)
     with open(path, "wb") as f:
