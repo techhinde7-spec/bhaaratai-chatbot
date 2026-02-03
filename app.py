@@ -146,8 +146,6 @@ def hf_post_with_backoff(url, headers, payload):
         except Exception:
             time.sleep(2 ** attempt)
     raise RuntimeError("HF request failed after retries")
-
-
 def call_hf_image(prompt, model):
     if not HF_API_TOKEN:
         raise RuntimeError("HF_API_TOKEN missing")
@@ -158,17 +156,69 @@ def call_hf_image(prompt, model):
         "Accept": "*/*"
     }
 
+    # 🔥 SDXL-OPTIMIZED PAYLOAD
     payload = {
         "inputs": prompt,
-        "options": {"wait_for_model": True}
+        "parameters": {
+            "height": 1024,
+            "width": 1024,
+            "guidance_scale": 7.5,
+            "num_inference_steps": 30,
+            "negative_prompt": (
+                "low quality, blurry, old style, cartoonish, plastic, "
+                "flat lighting, washed colors, bad anatomy, extra limbs"
+            )
+        },
+        "options": {
+            "wait_for_model": True
+        }
     }
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    resp = requests.post(url, headers=headers, json=payload, timeout=HF_TIMEOUT)
 
     if resp.status_code != 200:
         raise RuntimeError(resp.text)
 
     content_type = (resp.headers.get("Content-Type") or "").lower()
+
+    # ✅ CASE 1: raw image bytes
+    if content_type.startswith("image/"):
+        return [
+            save_bytes_and_get_url(
+                resp.content,
+                content_type
+            )
+        ]
+
+    # Try JSON
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError("HF returned non-image response")
+
+    # Base64 fallbacks
+    if isinstance(data, str):
+        url = save_base64_and_return_url(data)
+        if url:
+            return [url]
+
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                url = save_base64_and_return_url(item)
+                if url:
+                    return [url]
+
+    if isinstance(data, dict):
+        for key in ("image", "b64", "b64_json", "data"):
+            val = data.get(key)
+            if isinstance(val, str):
+                url = save_base64_and_return_url(val)
+                if url:
+                    return [url]
+
+    raise RuntimeError("No image found in HF response")
+
 
 # ✅ CASE 1: raw image bytes
     if content_type.startswith("image/"):
