@@ -125,13 +125,25 @@ SIZE_PRESETS = {
 }
 
 def build_image_prompt(prompt, style=None, size=None):
-    parts = [prompt]
+    parts = [
+        prompt,
+        "highly detailed cinematic 3D render",
+        "modern animation style",
+        "global illumination",
+        "soft shadows",
+        "ultra realistic textures",
+        "professional lighting",
+        "8k resolution"
+    ]
+
     if style in STYLE_PRESETS:
         parts.append(STYLE_PRESETS[style])
+
     if size in SIZE_PRESETS:
         parts.append(SIZE_PRESETS[size])
-    parts.append("high quality, sharp focus, no blur")
+
     return ", ".join(parts)
+
 
 # ---------- HF HELPERS ----------
 def hf_post_with_backoff(url, headers, payload):
